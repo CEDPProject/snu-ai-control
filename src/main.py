@@ -25,6 +25,8 @@ from accelerate.utils import set_seed
 _logger = get_logger('train')
 
 def main(cfg):
+    # set logger
+    setup_default_logging()
     # set seed
     set_seed(cfg.DEFAULT.seed)
     
