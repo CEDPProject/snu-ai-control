@@ -27,7 +27,8 @@ _logger = get_logger('train')
 def main(cfg):
     
     # set logger
-    setup_default_logging()
+    logger = setup_default_logging()
+    
     # set seed
     set_seed(cfg.DEFAULT.seed)
     
