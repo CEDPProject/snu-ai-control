@@ -28,7 +28,7 @@ def main(cfg):
     
     # set logger
     logger = setup_default_logging()
-    
+
     # set seed
     set_seed(cfg.DEFAULT.seed)
     
@@ -42,7 +42,7 @@ def main(cfg):
                                     resume = cfg.TRAIN.resume)
     
     # set device
-    _logger.info('Device: {}'.format(accelerator.device), main_process_only=False)
+    logger.info('Device: {}'.format(accelerator.device), main_process_only=False)
     
     # load and define dataloader
     information_dict, trn_dataloader, val_dataloader, tst_dataloader = LG_create_dataloader(
