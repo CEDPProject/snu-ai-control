@@ -25,6 +25,7 @@ from accelerate.utils import set_seed
 _logger = get_logger('train')
 
 def main(cfg):
+    
     # set logger
     setup_default_logging()
     # set seed
@@ -33,12 +34,6 @@ def main(cfg):
     # set accelrator
     accelerator = Accelerator()
 
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    
     # make save directory
     savedir = os.path.join(cfg.RESULT.savedir, cfg.MODEL.modelname, cfg.DEFAULT.exp_name)
     loaddir, savedir = version_build(accelerator = accelerator,
