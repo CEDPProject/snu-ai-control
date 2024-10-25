@@ -22,3 +22,4 @@ def setup_default_logging(default_level=logging.INFO, log_path=''):
         file_formatter = logging.Formatter("%(asctime)s - %(name)20s: [%(levelname)8s] - %(message)s")
         file_handler.setFormatter(file_formatter)
         logging.root.addHandler(file_handler)
+    return logging.getLogger()
