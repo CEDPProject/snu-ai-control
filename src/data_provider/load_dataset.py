@@ -14,6 +14,7 @@ def load_dataset(
                 category_name: str,
                 datadir: str,
                 scale: str,
+                structure: str,
                 train_only: bool = False,
                 pre_training: bool = False,
                 data_num: int = 0,
@@ -46,58 +47,7 @@ def load_dataset(
     
     
     
-
-    # tabular data information
-    columns_list = list(df_raw_tabular_train.columns)
-
-    category_var = [cat for cat in columns_list if 'CAT' in cat]
-    cat_field_dims = list(df_raw_tabular_train[category_var].nunique())
-    cat_embed_input = [(u,i) for u,i in zip(category_var, cat_field_dims)]
-    num_category = len(category_var)
-    
-    continuous_var = [con for con in columns_list if 'FLT' in con or 'INT' in con]
-    column_idx = {k:v for v,k in enumerate(columns_list)}
-    num_continuous = len(continuous_var)
-    
-    tabular_category_train = df_raw_tabular_train[category_var]
-    tabular_continuous_train = df_raw_tabular_train[continuous_var]
-    tabular_category_test = df_raw_tabular_test[category_var]
-    tabular_continuous_test = df_raw_tabular_test[continuous_var]
-    
-    information_dict = {
-        'cat_field_dims' : cat_field_dims,
-        'cat_embed_input' : cat_embed_input,
-        'column_idx' : column_idx,
-        'num_category' : num_category,
-        'num_continuous' : num_continuous
-    }
-    
-    
-    # category
-    trn_category = tabular_category_train.loc[train_idx]
-    val_category = tabular_category_train.loc[valid_idx]
-    tst_category = tabular_category_test
-
-    # continuous
-    trn_continuous = tabular_continuous_train.loc[train_idx]
-    val_continuous = tabular_continuous_train.loc[valid_idx]
-    tst_continuous = tabular_continuous_test
-
-    # tsa
-    trn_tsa = df_raw_tsa_train.loc[train_idx]
-    val_tsa = df_raw_tsa_train.loc[valid_idx]
-    tst_tsa = df_raw_tsa_test
-
-    # tsb
-    trn_tsb = df_raw_tsb_train.loc[train_idx]
-    val_tsb = df_raw_tsb_train.loc[valid_idx]
-    tst_tsb = df_raw_tsb_test
-
-    # target
-    trn_target = df_raw_target_train.loc[train_idx]
-    val_target = df_raw_target_train.loc[valid_idx]
-    tst_target = df_raw_target_test
-        
+    # 데이터 전처리
     if scale is not None:
         if scale == 'minmax':
             scaler_con = MinMaxScaler(feature_range=(-1, 1))
