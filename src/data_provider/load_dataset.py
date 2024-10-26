@@ -35,10 +35,14 @@ def load_dataset(
     # 실적 데이터
     weather_gt = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
     power_gt   = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
-
+    
+    # 발전 호기 필터링
     ecmwf_fcst = filtering_id(ecmwf_fcst, location, category_name)
     um_fcst    = filtering_id(um_fcst, location, category_name)
     wrf_fcst   = filtering_id(wrf_fcst, location, category_name)
+    
+    # 동일 CRTN_TM, FCST_TM 필터링
+    ecmwf_fcst, um_fcst, wrf_fcst = align_times(ecmwf_fcst, um_fcst, wrf_fcst)
 
     if not train_test_predefined:
         df_raw_tabular = pd.read_csv(os.path.join(datadir, 'tabular_data.csv'), index_col=0)
@@ -237,3 +241,26 @@ def filtering_id(fcst, location, category_name):
         unit_ids = location['UNIT_ID'].unique()
     filtered_wind_ecmwf = fcst[fcst['AREA_GRP_ID'].isin(unit_ids)]
     return filtered_wind_ecmwf
+
+# 동일 CRTN_TM, FCST_TM 필터링
+def align_times(df1, df2, df3):
+    # 날짜 형식을 동일하게 맞춤
+    for df in [df1, df2, df3]:
+        df = df.copy()  # 원본 DataFrame을 보호하기 위해 복사본을 사용
+        df.loc[:, 'CRTN_TM'] = pd.to_datetime(df['CRTN_TM'], format='%Y%m%d%H%M')
+        df.loc[:, 'FCST_TM'] = pd.to_datetime(df['FCST_TM'], format='%Y%m%d%H%M')
+
+    # 중복 제거 후 공통 시간을 찾기 위해 각 DataFrame에서 (CRTN_TM, FCST_TM) 쌍 추출
+    df1_times = set(df1[['CRTN_TM', 'FCST_TM']].drop_duplicates().apply(tuple, axis=1))
+    df2_times = set(df2[['CRTN_TM', 'FCST_TM']].drop_duplicates().apply(tuple, axis=1))
+    df3_times = set(df3[['CRTN_TM', 'FCST_TM']].drop_duplicates().apply(tuple, axis=1))
+
+    # 공통 시간 계산
+    common_times = df1_times.intersection(df2_times, df3_times)
+    
+    # 공통 시간으로 각 데이터프레임 필터링
+    filtered_df1 = df1[df1[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
+    filtered_df2 = df2[df2[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
+    filtered_df3 = df3[df3[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
+
+    return filtered_df1, filtered_df2, filtered_df3
