@@ -34,11 +34,11 @@ def load_dataset(
 
     # 실적 데이터
     weather_gt = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
-    power_gt  = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
+    power_gt   = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
 
     ecmwf_fcst = filtering_id(ecmwf_fcst, location, category_name)
-    um_fcst = filtering_id(um_fcst, location, category_name)
-    wrf_fcst = filtering_id(wrf_fcst, location, category_name)
+    um_fcst    = filtering_id(um_fcst, location, category_name)
+    wrf_fcst   = filtering_id(wrf_fcst, location, category_name)
 
     if not train_test_predefined:
         df_raw_tabular = pd.read_csv(os.path.join(datadir, 'tabular_data.csv'), index_col=0)
