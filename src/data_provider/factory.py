@@ -25,6 +25,8 @@ def LG_create_dataloader(
                 ):
 
     assert scale in (None, 'minmax', 'minmax_square', 'standard')
+    assert category_name in ('solar', 'windw')
+    assert structure in ('independence', 'merge')
 
     information_dict, trn_list, val_list, tst_list = load_dataset(
                                                         datadir                = datadir,
