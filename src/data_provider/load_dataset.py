@@ -19,7 +19,6 @@ def load_dataset(
                 pre_training: bool = False,
                 data_num: int = 0,
                 split_rate: list = [0.8, 0.1, 0.1]):
-    
     # 태양광 발전량
     if category_name == 'solar':
         location     = pd.read_csv(os.path.join(datadir, "태양광/샘플_태양광발전단지_위치정보.csv"), encoding='cp949')
@@ -45,6 +44,8 @@ def load_dataset(
     # 동일 CRTN_TM, FCST_TM 필터링
     ecmwf_fcst, um_fcst, wrf_fcst, common_times = align_times(ecmwf_fcst, um_fcst, wrf_fcst)
     
+    if structure == 'independence':
+        
     
     
     # 데이터 전처리
