@@ -226,7 +226,7 @@ def load_dataset(
 
 
 # 발전 호기 필터링
-def filtering_data(fcst, location, category_name):
+def filtering_id(fcst, location, category_name):
     if category_name == 'solar':
         unit_ids = location['GEN_ID'].unique()
     elif category_name == 'wind':
