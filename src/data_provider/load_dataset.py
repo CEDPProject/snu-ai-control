@@ -237,7 +237,7 @@ def align_times(df1, df2, df3):
     df3_times = set(df3[['CRTN_TM', 'FCST_TM']].drop_duplicates().apply(tuple, axis=1))
 
     # 공통 시간 계산
-    common_times = df1_times.intersection(df2_times, df3_times)
+    common_times = sorted(df1_times.intersection(df2_times, df3_times))
     
     # 공통 시간으로 각 데이터프레임 필터링
     filtered_df1 = df1[df1[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
