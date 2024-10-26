@@ -18,6 +18,7 @@ def load_dataset(
                 train_only: bool = False,
                 pre_training: bool = False,
                 data_num: int = 0,
+                del_feature: list = ['SWDDIR'],
                 split_rate: list = [0.8, 0.1, 0.1]):
     # 태양광 발전량
     if category_name == 'solar':
@@ -40,11 +41,18 @@ def load_dataset(
     ecmwf_fcst = filtering_id(ecmwf_fcst, location, category_name)
     um_fcst    = filtering_id(um_fcst, location, category_name)
     wrf_fcst   = filtering_id(wrf_fcst, location, category_name)
-    
+
+    ecmwf_fcst = remove_columns(ecmwf_fcst, del_feature)
+    um_fcst = remove_columns(um_fcst, del_feature)
+    wrf_fcst = remove_columns(wrf_fcst, del_feature)
+
     # 동일 CRTN_TM, FCST_TM 필터링
     ecmwf_fcst, um_fcst, wrf_fcst, common_times = align_times(ecmwf_fcst, um_fcst, wrf_fcst)
     
     if structure == 'independence':
+        data_list = [ecmwf_fcst, um_fcst, wrf_fcst, weather_gt, power_gt]
+    else:
+        data_list = [ecmwf_fcst, um_fcst, wrf_fcst, location, weather_gt, power_gt]
         
     
     
@@ -196,3 +204,7 @@ def align_times(df1, df2, df3):
     filtered_df3 = df3[df3[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
 
     return filtered_df1, filtered_df2, filtered_df3, common_times
+
+def remove_columns(df, columns):
+    df = df.drop(columns=[col for col in columns if col in df.columns], errors='ignore')
+    return df
