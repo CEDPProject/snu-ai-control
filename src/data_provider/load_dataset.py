@@ -42,29 +42,10 @@ def load_dataset(
     wrf_fcst   = filtering_id(wrf_fcst, location, category_name)
     
     # 동일 CRTN_TM, FCST_TM 필터링
-    ecmwf_fcst, um_fcst, wrf_fcst = align_times(ecmwf_fcst, um_fcst, wrf_fcst)
-
-    if not train_test_predefined:
-        df_raw_tabular = pd.read_csv(os.path.join(datadir, 'tabular_data.csv'), index_col=0)
-        df_raw_tsa = pd.read_csv(os.path.join(datadir, 'SA_data.csv'), index_col=0)
-        df_raw_tsb = pd.read_csv(os.path.join(datadir, 'SB_data.csv'), index_col=0)
-        df_raw_target = pd.read_csv(os.path.join(datadir, 'target_data.csv'), index_col=0)
-    else:
-        if pre_training:
-            data_num=f'Total_Equipment'
-        else:
-            data_num=f'Equipment_{data_num}'
-        df_raw_tabular_train = pd.read_csv(os.path.join(datadir, data_num,'tabular_train.csv'), index_col=0)
-        df_raw_tabular_test = pd.read_csv(os.path.join(datadir, data_num,'tabular_test.csv'), index_col=0)
-        df_raw_tsa_train = pd.read_csv(os.path.join(datadir, data_num,'SA_train.csv'), index_col=0)
-        df_raw_tsa_test = pd.read_csv(os.path.join(datadir, data_num,'SA_test.csv'), index_col=0)
-        df_raw_tsb_train = pd.read_csv(os.path.join(datadir, data_num,'SB_train.csv'), index_col=0)
-        df_raw_tsb_test = pd.read_csv(os.path.join(datadir, data_num,'SB_test.csv'), index_col=0)
-        df_raw_target_train = pd.read_csv(os.path.join(datadir, data_num,'label_train.csv'), index_col=0)
-        df_raw_target_test = pd.read_csv(os.path.join(datadir, data_num,'label_test.csv'), index_col=0)
-
-    train_idx = df_raw_tabular_train.index
-    _, _, train_idx, valid_idx = train_test_split(df_raw_tabular_train, train_idx, train_size = split_rate[0], shuffle=True, stratify=df_raw_tabular_train[['CAT_001','CAT_002']])
+    ecmwf_fcst, um_fcst, wrf_fcst, common_times = align_times(ecmwf_fcst, um_fcst, wrf_fcst)
+    
+    
+    
 
     # tabular data information
     columns_list = list(df_raw_tabular_train.columns)
@@ -263,4 +244,4 @@ def align_times(df1, df2, df3):
     filtered_df2 = df2[df2[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
     filtered_df3 = df3[df3[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
 
-    return filtered_df1, filtered_df2, filtered_df3
+    return filtered_df1, filtered_df2, filtered_df3, common_times
