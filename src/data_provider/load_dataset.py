@@ -21,16 +21,12 @@ def load_dataset(
     
     # 태양광 발전량
     if category_name == 'solar':
-        weather_fcst = pd.read_csv(os.path.join(datadir, "태양광/샘플_태양광발전단지_기상예측데이터.csv"))
-        power_fcst   = pd.read_csv(os.path.join(datadir, "태양광/샘플_태양광발전단지_발전량예측데이터.csv"))
         location     = pd.read_csv(os.path.join(datadir, "태양광/샘플_태양광발전단지_위치정보.csv"), encoding='cp949')
         ecmwf_fcst   = pd.read_csv(os.path.join(datadir, "태양광/샘플_태양광발전단지_ECMWF_수치예보데이터.csv"))
         um_fcst      = pd.read_csv(os.path.join(datadir, "태양광/샘플_태양광발전단지_UM_수치예보데이터.csv"))
         wrf_fcst     = pd.read_csv(os.path.join(datadir, "태양광/샘플_태양광발전단지_WRF_수치예보데이터.csv"))
     # 풍력 발전량
     elif category_name == 'wind':
-        weather_fcst = pd.read_csv(os.path.join(datadir, "풍력/샘플_풍력발전단지_기상예측데이터.csv"))
-        power_fcst   = pd.read_csv(os.path.join(datadir, "풍력/샘플_풍력발전단지_발전량예측데이터.csv"))
         location     = pd.read_csv(os.path.join(datadir, "풍력/샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
         ecmwf_fcst   = pd.read_csv(os.path.join(datadir, "풍력/샘플_풍력발전단지_ECMWF_수치예보데이터.csv"))
         um_fcst      = pd.read_csv(os.path.join(datadir, "풍력/샘플_풍력발전단지_UM_수치예보데이터.csv"))
