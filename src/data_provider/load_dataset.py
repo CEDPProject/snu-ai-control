@@ -233,20 +233,6 @@ def load_dataset(
 
 # 발전 호기 필터링
 def filter_wind_ecmwf_by_unit_id(wind_ho_location, wind_ecmwf):
-    """
-    Filters the wind_ecmwf DataFrame based on UNIT_ID values from wind_ho_location.
-    
-    Parameters:
-        wind_ho_location (pd.DataFrame): DataFrame containing UNIT_ID column.
-        wind_ecmwf (pd.DataFrame): DataFrame containing AREA_GRP_ID column.
-    
-    Returns:
-        pd.DataFrame: Filtered DataFrame where AREA_GRP_ID matches UNIT_ID values.
-    """
-    # wind_ho_location의 UNIT_ID에서 고유한 발전 호기 이름 목록 추출
     unit_ids = wind_ho_location['UNIT_ID'].unique()
-
-    # wind_ecmwf에서 AREA_GRP_ID가 unit_ids 리스트에 포함된 행만 필터링
     filtered_wind_ecmwf = wind_ecmwf[wind_ecmwf['AREA_GRP_ID'].isin(unit_ids)]
-    
     return filtered_wind_ecmwf
