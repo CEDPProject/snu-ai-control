@@ -36,8 +36,6 @@ def load_dataset(
     weather_gt = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
     power_gt  = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
 
-
-
     if not train_test_predefined:
         df_raw_tabular = pd.read_csv(os.path.join(datadir, 'tabular_data.csv'), index_col=0)
         df_raw_tsa = pd.read_csv(os.path.join(datadir, 'SA_data.csv'), index_col=0)
@@ -228,7 +226,10 @@ def load_dataset(
 
 
 # 발전 호기 필터링
-def filter_wind_ecmwf_by_unit_id(wind_ho_location, wind_ecmwf):
-    unit_ids = wind_ho_location['UNIT_ID'].unique()
-    filtered_wind_ecmwf = wind_ecmwf[wind_ecmwf['AREA_GRP_ID'].isin(unit_ids)]
+def filtering_data(fcst, location, category_name):
+    if category_name == 'solar':
+        unit_ids = location['GEN_ID'].unique()
+    elif category_name == 'wind':
+        unit_ids = location['UNIT_ID'].unique()
+    filtered_wind_ecmwf = fcst[fcst['AREA_GRP_ID'].isin(unit_ids)]
     return filtered_wind_ecmwf
