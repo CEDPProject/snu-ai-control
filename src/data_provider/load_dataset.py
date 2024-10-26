@@ -31,7 +31,7 @@ def load_dataset(
         ecmwf_fcst   = pd.read_csv(os.path.join(datadir, "풍력/샘플_풍력발전단지_ECMWF_수치예보데이터.csv"))
         um_fcst      = pd.read_csv(os.path.join(datadir, "풍력/샘플_풍력발전단지_UM_수치예보데이터.csv"))
         wrf_fcst     = pd.read_csv(os.path.join(datadir, "풍력/샘플_풍력발전단지_WRF_수치예보데이터.csv"), low_memory=False, encoding='euc-kr')
-
+    
     # 실적 데이터
     weather_gt = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
     power_gt   = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
