@@ -38,7 +38,7 @@ def load_dataset(
 
     # 실적 데이터
     weather_gt = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
-    power_gft  = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
+    power_gt  = pd.read_csv(os.path.join(datadir, "샘플_풍력발전단지_호기별_위치정보.csv"), encoding='euc-kr')
 
 
 
