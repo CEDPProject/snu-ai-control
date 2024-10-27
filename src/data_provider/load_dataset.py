@@ -124,7 +124,7 @@ def load_dataset(
             trn_scaling_tsb = scaler_tsb.transform(trn_tsb)
             val_scaling_tsb = scaler_tsb.transform(val_tsb)
             tst_scaling_tsb = scaler_tsb.transform(tst_tsb)
-        print(f'{scale} Normalization done')
+        
     
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
     print(f"valid: CAT_001: {Counter(val_category['CAT_001'])}  CAT_002: {Counter(val_category['CAT_002'])}")
@@ -168,3 +168,31 @@ def align_times(df1, df2, df3):
 def remove_columns(df, columns):
     df = df.drop(columns=[col for col in columns if col in df.columns], errors='ignore')
     return df
+
+def apply_scaling(data_list, scale, structure):
+    scaler_map = {
+        'minmax': MinMaxScaler(feature_range=(-1, 1)),
+        'minmax_square': MinMaxScaler(),
+        'standard': StandardScaler()
+    }
+    scaler = scaler_map.get(scale)
+    scaler_dict = {}
+
+    if structure == 'independence':
+        scaled_data_list = []
+        for i, df in enumerate(data_list):
+            norm_df = df.copy()
+            norm_df.iloc[:, 2:] = scaler.fit_transform(norm_df.iloc[:, 2:]) ** (2 if scale == 'minmax_square' else 1)
+            scaled_data_list.append(norm_df)
+            scaler_dict[f'scaler_{i}'] = scaler
+            scaler = scaler_map.get(scale)
+
+    elif structure == 'merge':
+        norm_df = data_list[0].copy()
+        norm_df.iloc[:, 2:] = scaler.fit_transform(norm_df.iloc[:, 2:]) ** (2 if scale == 'minmax_square' else 1)
+        scaled_data_list = [norm_df]
+        scaler_dict['scaler_merged'] = scaler
+    
+    print(f'{scale} Normalization done')
+
+    return scaled_data_list, scaler_dict
