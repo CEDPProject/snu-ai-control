@@ -97,6 +97,7 @@ def align_times(df1, df2, df3):
     
     return filtered_df1, filtered_df2, filtered_df3, common_times
 
+# 특정 column 제거
 def remove_columns(df, columns):
     df = df.drop(columns=[col for col in columns if col in df.columns], errors='ignore')
     return df
