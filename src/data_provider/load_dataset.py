@@ -47,13 +47,16 @@ def load_dataset(
     wrf_fcst = remove_columns(wrf_fcst, del_feature)
 
     # 동일 CRTN_TM, FCST_TM 필터링
-    ecmwf_fcst, um_fcst, wrf_fcst, common_times = align_times(ecmwf_fcst, um_fcst, wrf_fcst)
+    ecmwf_fcst, um_fcst, wrf_fcst, align_time = align_times(ecmwf_fcst, um_fcst, wrf_fcst)
     
+    # 데이터 Input 구조 
     if structure == 'independence':
         data_list = [ecmwf_fcst, um_fcst, wrf_fcst, weather_gt, power_gt]
-    else:
-        data_list = [ecmwf_fcst, um_fcst, wrf_fcst, location, weather_gt, power_gt]
-        
+    elif structure == 'merge':
+        combined_df = pd.concat([ecmwf_fcst, um_fcst, wrf_fcst])
+        combined_df = combined_df.sort_values(by=["AREA_GRP_ID", "CRTN_TM", "FCST_TM"]).reset_index(drop=True)
+        data_list = [combined_df, location, weather_gt, power_gt]
+    
     
     
     # 데이터 전처리
@@ -161,10 +164,6 @@ def load_dataset(
                                     index=tst_tsb.index)
         
         print(f'{scale} Normalization done')
-    
-    trn_list = [trn_category, trn_continuous, trn_tsa, trn_tsb, trn_target]
-    val_list = [val_category, val_continuous, val_tsa, val_tsb, val_target]
-    tst_list = [tst_category, tst_continuous, tst_tsa, tst_tsb, tst_target]
     
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
     print(f"valid: CAT_001: {Counter(val_category['CAT_001'])}  CAT_002: {Counter(val_category['CAT_002'])}")
