@@ -73,8 +73,6 @@ def load_dataset(
             
             trn_scaling_continuous = scaler_con.transform(trn_continuous)
             val_scaling_continuous = scaler_con.transform(val_continuous)
-            tst_scaling_continuous = scaler_con.transform(tst_continuous)
-
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
     print(f"valid: CAT_001: {Counter(val_category['CAT_001'])}  CAT_002: {Counter(val_category['CAT_002'])}")
     print(f"test: CAT_001: {Counter(tst_category['CAT_001'])}  CAT_002: {Counter(tst_category['CAT_002'])}")
