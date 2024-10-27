@@ -59,7 +59,7 @@ def load_dataset(
     
     
     
-    
+
     # 데이터 전처리
     if scale is not None:
         if scale == 'minmax':
@@ -160,9 +160,7 @@ def load_dataset(
                                     columns=val_tsb.columns,
                                     index=val_tsb.index)
         
-        tst_tsb = pd.DataFrame(tst_scaling_tsb,
-                                    columns=tst_tsb.columns,
-                                    index=tst_tsb.index)
+
         
         print(f'{scale} Normalization done')
     
