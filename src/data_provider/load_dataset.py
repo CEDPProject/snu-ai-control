@@ -103,11 +103,6 @@ def load_dataset(
             trn_scaling_tsb = scaler_tsb.transform(trn_tsb) ** 2
             val_scaling_tsb = scaler_tsb.transform(val_tsb) ** 2
             tst_scaling_tsb = scaler_tsb.transform(tst_tsb) ** 2
-
-        elif scale == 'standard':
-            scaler_con = StandardScaler()
-            scaler_tsa = StandardScaler()
-            scaler_tsb = StandardScaler()
             
         
     
