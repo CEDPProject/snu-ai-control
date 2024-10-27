@@ -5,12 +5,10 @@ import logging.handlers
 class FormatterNoInfo(logging.Formatter):
     def __init__(self, fmt='%(levelname)s: %(message)s'):
         logging.Formatter.__init__(self, fmt)
-
     def format(self, record):
         if record.levelno == logging.INFO:
             return str(record.getMessage())
         return logging.Formatter.format(self, record)
-
 
 def setup_default_logging(default_level=logging.INFO, log_path=''):
     console_handler = logging.StreamHandler()

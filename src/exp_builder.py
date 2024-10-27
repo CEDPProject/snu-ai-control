@@ -9,10 +9,6 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 from accelerate import Accelerator
-from utils import ResultGeneratorSFR
-from utils.utils import cal_metric, cal_classification_metric, Float32Encoder
-from utils.tool import EarlyStopping
-from utils.classification_utils import get_roi_dict, classification_label_generator
 
 _logger = logging.getLogger('train')
 

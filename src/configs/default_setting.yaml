@@ -1,0 +1,45 @@
+DEFAULT:
+  exp_name: LG_multimodal
+  seed: 42
+
+DATASET:
+  datadir: ../data
+  train_only: null
+  scale: standard
+  split_rate: [0.9, 0.1, 0.1]
+  batch_size: 128
+  num_workers: 0
+  train_test_predefined: true
+  shuffle: true
+  pin_memory: true
+  drop_last: true
+  classification: false
+
+TRAIN:
+  epoch: 25
+  ckp_metric: loss
+  eval_epochs: 1
+  log_epochs: 1
+  log_eval_iter: 100
+  early_stopping_count: 5
+  resume: null
+  pre_training: false
+  data_num: 0
+  fine_tuning_method: full
+  wandb: 
+    use: false
+    wandb_iter: 500
+    exp_name: default
+    project_name: 'LG_multimodal'
+    entity: null
+LOSS:
+  loss_name: mse
+
+OPTIMIZER:
+  opt_name: adamw
+  lr: 0.0001
+  params:
+    weight_decay: 0.0005
+
+RESULT:
+  savedir: './saved_model'

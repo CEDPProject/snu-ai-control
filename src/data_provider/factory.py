@@ -2,7 +2,6 @@ import torch
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from data_provider.load_dataset import load_dataset
 from data_provider.build_dataset import LG_BuildDataset
-from utils.utils import seed_worker_1, seed_worker_2
 from omegaconf import OmegaConf
 import warnings
 import pdb
