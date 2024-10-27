@@ -80,7 +80,6 @@ def filtering_id(fcst, location, category_name):
 
 # 동일 CRTN_TM, FCST_TM 필터링
 def align_times(df1, df2, df3):
-    # 날짜 형식을 동일하게 맞춤
     for df in [df1, df2, df3]:
         df = df.copy()
         df.loc[:, 'CRTN_TM'] = pd.to_datetime(df['CRTN_TM'], format='%Y%m%d%H%M')
