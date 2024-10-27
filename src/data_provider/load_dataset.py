@@ -57,10 +57,11 @@ def load_dataset(
         combined_df = combined_df.sort_values(by=["AREA_GRP_ID", "CRTN_TM", "FCST_TM"]).reset_index(drop=True)
         data_list = [combined_df, location, weather_gt, power_gt]
     
-    
-    
-
     # 데이터 전처리
+
+
+
+
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
     print(f"valid: CAT_001: {Counter(val_category['CAT_001'])}  CAT_002: {Counter(val_category['CAT_002'])}")
     print(f"test: CAT_001: {Counter(tst_category['CAT_001'])}  CAT_002: {Counter(tst_category['CAT_002'])}")
