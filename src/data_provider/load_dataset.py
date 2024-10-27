@@ -150,12 +150,6 @@ def load_dataset(
         tst_tsa = pd.DataFrame(tst_scaling_tsa,
                                     columns=tst_tsa.columns,
                                     index=tst_tsa.index)
-
-        # scaled tsb
-        trn_tsb = pd.DataFrame(trn_scaling_tsb,
-                                    columns=trn_tsb.columns,
-                                    index=trn_tsb.index)
-
         
         print(f'{scale} Normalization done')
     
