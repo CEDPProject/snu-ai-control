@@ -58,7 +58,8 @@ def load_dataset(
         data_list = [combined_df, location, weather_gt, power_gt]
     
     # 데이터 전처리
-
+    if scale:
+        data_list, scaler_dict = apply_scaling(data_list, scale, structure)
 
 
 
@@ -103,7 +104,7 @@ def remove_columns(df, columns):
     return df
 
 # 데이터 전처리
-def apply_scaling(data_list, scale, structure):
+def apply_scaling(data_list, data_names, scale, structure):
     scaler_map = {
         'minmax': MinMaxScaler(feature_range=(-1, 1)),
         'minmax_square': MinMaxScaler(),
@@ -118,14 +119,14 @@ def apply_scaling(data_list, scale, structure):
             norm_df = df.copy()
             norm_df.iloc[:, 2:] = scaler.fit_transform(norm_df.iloc[:, 2:]) ** (2 if scale == 'minmax_square' else 1)
             scaled_data_list.append(norm_df)
-            scaler_dict[f'scaler_{i}'] = scaler
-            scaler = scaler_map.get(scale)
+            scaler_dict[data_names[i]] = scaler  # 이름으로 스케일러 저장
+            scaler = scaler_map.get(scale)  # 새로운 인스턴스 생성 (간섭 방지)
     
     elif structure == 'merge':
         norm_df = data_list[0].copy()
         norm_df.iloc[:, 2:] = scaler.fit_transform(norm_df.iloc[:, 2:]) ** (2 if scale == 'minmax_square' else 1)
         scaled_data_list = [norm_df]
-        scaler_dict['scaler_merged'] = scaler
+        scaler_dict['scaler_merged'] = scaler  # 합쳐진 데이터에 대한 스케일러 저장
     
     print(f'{scale} Normalization done')
     
