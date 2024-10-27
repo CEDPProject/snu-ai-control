@@ -117,9 +117,6 @@ def load_dataset(
             val_scaling_continuous = scaler_con.transform(val_continuous)
             tst_scaling_continuous = scaler_con.transform(tst_continuous)
             
-            trn_scaling_tsa = scaler_tsa.transform(trn_tsa)
-            val_scaling_tsa = scaler_tsa.transform(val_tsa)
-            tst_scaling_tsa = scaler_tsa.transform(tst_tsa)
 
         
     
