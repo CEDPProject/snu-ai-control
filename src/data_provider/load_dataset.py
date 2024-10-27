@@ -77,11 +77,6 @@ def load_dataset(
 
             trn_scaling_tsa = scaler_tsa.transform(trn_tsa)
             val_scaling_tsa = scaler_tsa.transform(val_tsa)
-            tst_scaling_tsa = scaler_tsa.transform(tst_tsa)
-            
-            trn_scaling_tsb = scaler_tsb.transform(trn_tsb)
-            val_scaling_tsb = scaler_tsb.transform(val_tsb)
-    
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
     print(f"valid: CAT_001: {Counter(val_category['CAT_001'])}  CAT_002: {Counter(val_category['CAT_002'])}")
     print(f"test: CAT_001: {Counter(tst_category['CAT_001'])}  CAT_002: {Counter(tst_category['CAT_002'])}")
