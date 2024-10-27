@@ -125,7 +125,6 @@ def load_dataset(
             val_scaling_tsb = scaler_tsb.transform(val_tsb)
             tst_scaling_tsb = scaler_tsb.transform(tst_tsb)
         
-
         
         print(f'{scale} Normalization done')
     
