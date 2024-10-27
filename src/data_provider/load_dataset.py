@@ -61,9 +61,6 @@ def load_dataset(
     
 
     # 데이터 전처리
-    if scale is not None:
-        if scale == 'minmax':
-            scaler_con = MinMaxScaler(feature_range=(-1, 1))
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
     print(f"valid: CAT_001: {Counter(val_category['CAT_001'])}  CAT_002: {Counter(val_category['CAT_002'])}")
     print(f"test: CAT_001: {Counter(tst_category['CAT_001'])}  CAT_002: {Counter(tst_category['CAT_002'])}")
