@@ -59,6 +59,7 @@ def load_dataset(
     
     
     
+    
     # 데이터 전처리
     if scale is not None:
         if scale == 'minmax':
