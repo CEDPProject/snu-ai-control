@@ -134,11 +134,6 @@ def load_dataset(
                                     columns=val_continuous.columns,
                                     index=val_continuous.index)
         
-        tst_continuous = pd.DataFrame(tst_scaling_continuous,
-                                    columns=tst_continuous.columns,
-                                    index=tst_continuous.index)
-        
-        
         print(f'{scale} Normalization done')
     
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
