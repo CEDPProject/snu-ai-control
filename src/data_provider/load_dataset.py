@@ -102,6 +102,7 @@ def remove_columns(df, columns):
     df = df.drop(columns=[col for col in columns if col in df.columns], errors='ignore')
     return df
 
+# 데이터 전처리
 def apply_scaling(data_list, scale, structure):
     scaler_map = {
         'minmax': MinMaxScaler(feature_range=(-1, 1)),
