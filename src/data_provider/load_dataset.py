@@ -81,13 +81,6 @@ def load_dataset(
             
             trn_scaling_tsb = scaler_tsb.transform(trn_tsb)
             val_scaling_tsb = scaler_tsb.transform(val_tsb)
-            tst_scaling_tsb = scaler_tsb.transform(tst_tsb)
-
-        elif scale == 'minmax_square':
-            scaler_con = MinMaxScaler()
-            scaler_tsa = MinMaxScaler()
-            scaler_tsb = MinMaxScaler()
-            
     
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
     print(f"valid: CAT_001: {Counter(val_category['CAT_001'])}  CAT_002: {Counter(val_category['CAT_002'])}")
