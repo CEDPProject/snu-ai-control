@@ -120,7 +120,7 @@ def apply_scaling(data_list, data_names, scale, structure):
             norm_df.iloc[:, 2:] = scaler.fit_transform(norm_df.iloc[:, 2:]) ** (2 if scale == 'minmax_square' else 1)
             scaled_data_list.append(norm_df)
             scaler_dict[data_names[i]] = scaler  # 이름으로 스케일러 저장
-            scaler = scaler_map.get(scale)  # 새로운 인스턴스 생성 (간섭 방지)
+            scaler = scaler_map.get(scale)
     
     elif structure == 'merge':
         norm_df = data_list[0].copy()
