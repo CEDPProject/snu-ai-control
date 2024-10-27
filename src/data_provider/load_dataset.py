@@ -82,23 +82,20 @@ def filtering_id(fcst, location, category_name):
 def align_times(df1, df2, df3):
     # 날짜 형식을 동일하게 맞춤
     for df in [df1, df2, df3]:
-        df = df.copy()  # 원본 DataFrame을 보호하기 위해 복사본을 사용
+        df = df.copy()
         df.loc[:, 'CRTN_TM'] = pd.to_datetime(df['CRTN_TM'], format='%Y%m%d%H%M')
         df.loc[:, 'FCST_TM'] = pd.to_datetime(df['FCST_TM'], format='%Y%m%d%H%M')
-
-    # 중복 제거 후 공통 시간을 찾기 위해 각 DataFrame에서 (CRTN_TM, FCST_TM) 쌍 추출
+    
     df1_times = set(df1[['CRTN_TM', 'FCST_TM']].drop_duplicates().apply(tuple, axis=1))
     df2_times = set(df2[['CRTN_TM', 'FCST_TM']].drop_duplicates().apply(tuple, axis=1))
     df3_times = set(df3[['CRTN_TM', 'FCST_TM']].drop_duplicates().apply(tuple, axis=1))
-
-    # 공통 시간 계산
+    
     common_times = sorted(df1_times.intersection(df2_times, df3_times))
     
-    # 공통 시간으로 각 데이터프레임 필터링
     filtered_df1 = df1[df1[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
     filtered_df2 = df2[df2[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
     filtered_df3 = df3[df3[['CRTN_TM', 'FCST_TM']].apply(tuple, axis=1).isin(common_times)]
-
+    
     return filtered_df1, filtered_df2, filtered_df3, common_times
 
 def remove_columns(df, columns):
@@ -113,7 +110,7 @@ def apply_scaling(data_list, scale, structure):
     }
     scaler = scaler_map.get(scale)
     scaler_dict = {}
-
+    
     if structure == 'independence':
         scaled_data_list = []
         for i, df in enumerate(data_list):
@@ -122,7 +119,7 @@ def apply_scaling(data_list, scale, structure):
             scaled_data_list.append(norm_df)
             scaler_dict[f'scaler_{i}'] = scaler
             scaler = scaler_map.get(scale)
-
+    
     elif structure == 'merge':
         norm_df = data_list[0].copy()
         norm_df.iloc[:, 2:] = scaler.fit_transform(norm_df.iloc[:, 2:]) ** (2 if scale == 'minmax_square' else 1)
@@ -130,5 +127,5 @@ def apply_scaling(data_list, scale, structure):
         scaler_dict['scaler_merged'] = scaler
     
     print(f'{scale} Normalization done')
-
+    
     return scaled_data_list, scaler_dict
