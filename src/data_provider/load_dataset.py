@@ -126,7 +126,7 @@ def apply_scaling(data_list, data_names, scale, structure):
         norm_df = data_list[0].copy()
         norm_df.iloc[:, 2:] = scaler.fit_transform(norm_df.iloc[:, 2:]) ** (2 if scale == 'minmax_square' else 1)
         scaled_data_list = [norm_df]
-        scaler_dict['scaler_merged'] = scaler  # 합쳐진 데이터에 대한 스케일러 저장
+        scaler_dict['scaler_merged'] = scaler
     
     print(f'{scale} Normalization done')
     
