@@ -59,7 +59,10 @@ def load_dataset(
     
     # 데이터 전처리
     if scale:
-        data_list, scaler_dict = apply_scaling(data_list, scale, structure)
+        data_list, scaler_dict = apply_scaling(data_list, 
+                                                scale, 
+                                                structure, 
+                                                data_names = ['ecmwf_fcst', 'um_fcst', 'wrf_fcst'])
 
 
 
@@ -104,7 +107,7 @@ def remove_columns(df, columns):
     return df
 
 # 데이터 전처리
-def apply_scaling(data_list, data_names, scale, structure):
+def apply_scaling(data_list, scale, structure, data_names = ['ecmwf_fcst', 'um_fcst', 'wrf_fcst']):
     scaler_map = {
         'minmax': MinMaxScaler(feature_range=(-1, 1)),
         'minmax_square': MinMaxScaler(),
