@@ -125,10 +125,6 @@ def load_dataset(
             val_scaling_tsb = scaler_tsb.transform(val_tsb)
             tst_scaling_tsb = scaler_tsb.transform(tst_tsb)
         
-        # scaled continuous
-        trn_continuous = pd.DataFrame(trn_scaling_continuous,
-                                    columns=trn_continuous.columns,
-                                    index=trn_continuous.index)
 
         
         print(f'{scale} Normalization done')
