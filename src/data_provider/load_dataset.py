@@ -100,10 +100,6 @@ def load_dataset(
             val_scaling_tsa = scaler_tsa.transform(val_tsa) ** 2
             tst_scaling_tsa = scaler_tsa.transform(tst_tsa) ** 2
             
-            trn_scaling_tsb = scaler_tsb.transform(trn_tsb) ** 2
-            val_scaling_tsb = scaler_tsb.transform(val_tsb) ** 2
-            tst_scaling_tsb = scaler_tsb.transform(tst_tsb) ** 2
-            
         
     
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
