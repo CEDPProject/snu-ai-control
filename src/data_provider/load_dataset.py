@@ -109,10 +109,6 @@ def load_dataset(
             scaler_tsa = StandardScaler()
             scaler_tsb = StandardScaler()
             
-            scaler_con.fit(trn_continuous)
-            scaler_tsa.fit(trn_tsa)
-            scaler_tsb.fit(trn_tsb)
-            
         
     
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
