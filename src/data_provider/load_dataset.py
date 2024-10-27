@@ -69,8 +69,6 @@ def load_dataset(
             
             scaler_con.fit(trn_continuous)
             scaler_tsa.fit(trn_tsa)
-            scaler_tsb.fit(trn_tsb)
-            
     print(f"train: CAT_001: {Counter(trn_category['CAT_001'])}  CAT_002: {Counter(trn_category['CAT_002'])}")
     print(f"valid: CAT_001: {Counter(val_category['CAT_001'])}  CAT_002: {Counter(val_category['CAT_002'])}")
     print(f"test: CAT_001: {Counter(tst_category['CAT_001'])}  CAT_002: {Counter(tst_category['CAT_002'])}")
