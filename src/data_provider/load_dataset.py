@@ -130,9 +130,6 @@ def load_dataset(
                                     columns=trn_continuous.columns,
                                     index=trn_continuous.index)
 
-        val_continuous = pd.DataFrame(val_scaling_continuous,
-                                    columns=val_continuous.columns,
-                                    index=val_continuous.index)
         
         print(f'{scale} Normalization done')
     
