@@ -156,11 +156,6 @@ def load_dataset(
                                     columns=trn_tsb.columns,
                                     index=trn_tsb.index)
 
-        val_tsb = pd.DataFrame(val_scaling_tsb,
-                                    columns=val_tsb.columns,
-                                    index=val_tsb.index)
-        
-
         
         print(f'{scale} Normalization done')
     
