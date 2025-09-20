@@ -1,62 +1,53 @@
-from torch.utils.data import Dataset
-import numpy as np
-import pandas as pd
 import torch
-import warnings
+from torch.utils.data import Dataset
+import pickle
+import os
 
-warnings.filterwarnings('ignore')
-
-class LG_BuildDataset(Dataset):
-    def __init__(self, data_list: list):
+class HVACDataset(Dataset):
+    """공조 시스템 시계열 데이터셋"""
+    
+    def __init__(self, data, seq_len, pred_len, feature_indices=None):
+        """
+        Args:
+            data (numpy.ndarray): 전체 데이터 (n_samples, n_features)
+            seq_len (int): 입력 시퀀스 길이
+            pred_len (int): 예측 시퀀스 길이
+            feature_indices (dict, optional): feature 타입별 인덱스
+        """
+        self.data = data
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.feature_indices = feature_indices
         
-        self.input_category = data_list[0]
-        self.input_continuous = data_list[1]
-        self.input_tsa = data_list[2]
-        self.input_tsb = data_list[3]
-        self.target = data_list[4]
+        # 시계열 데이터에서 가능한 샘플 수 계산
+        self.total_len = seq_len + pred_len
         
-        self.data_tsa = pd.DataFrame(self.input_tsa,
-                                    columns=self.input_tsa.columns,
-                                    index=self.input_tsa.index)
-        
-        self.data_tsb = pd.DataFrame(self.input_tsb,
-                                    columns=self.input_tsb.columns,
-                                    index=self.input_tsb.index)
-        
-        self.valid_idxs = np.array(self.input_category.index)
-        
-        print(f"# of valid windows: {len(self.valid_idxs)}")
-
+    def __len__(self):
+        # 시퀀스를 만들 수 있는 샘플 수
+        return len(self.data) - self.total_len + 1
+    
     def __getitem__(self, idx):
-        i = self.valid_idxs[idx]
-        # Tabular dataset
-        input_tabular_cat = np.array(self.input_category.loc[i])
-        input_tabular_con = np.array(self.input_continuous.loc[i])
+        """
+        Returns:
+            x_seq: 입력 시퀀스 (seq_len, n_features)
+            y_seq: 타겟 시퀀스 (pred_len, n_features)
+        """
+        # 입력 시퀀스
+        x_begin = idx
+        x_end = x_begin + self.seq_len
+        x_seq = self.data[x_begin:x_end]
         
-        # Time-series A dataset
-        input_tsa = np.array(self.input_tsa.loc[i])
-
-        # Time-series B dataset
-        input_tsb = np.array(self.input_tsb.loc[i])
-
-        # Label dataset
-        target = np.array(self.target.loc[i])
-
-        item = {
-            'inputs': {
-                'tabular': {
-                    'cat': torch.Tensor(input_tabular_cat),
-                    'con': torch.Tensor(input_tabular_con)
-                },
-                'tsa': torch.Tensor(input_tsa),
-                'tsb': torch.Tensor(input_tsb)
-            },
-            'targets': torch.Tensor(target)
-        }
-                
-        return item
+        # 타겟 시퀀스 (바로 다음 시점부터)
+        y_begin = x_end
+        y_end = y_begin + self.pred_len
+        y_seq = self.data[y_begin:y_end]
+        
+        # Tensor로 변환
+        x_seq = torch.FloatTensor(x_seq)
+        y_seq = torch.FloatTensor(y_seq)
+        
+        return x_seq, y_seq
     
-    def __len__(self):        
-        return len(self.valid_idxs)
-    
-    
+    def get_feature_info(self):
+        """Feature 정보 반환"""
+        return self.feature_indices

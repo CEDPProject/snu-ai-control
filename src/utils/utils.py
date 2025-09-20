@@ -28,4 +28,3 @@ def version_build(accelerator, logdir: str, resume: int=None) -> str:
     if accelerator.is_main_process:
         os.makedirs(save_dir)
     return load_dir, save_dir
-        
