@@ -8,3 +8,4 @@ MPCController:
   power_weight: 1.0
   comfort_weight: 0.5
   control_change_weight: 0.1
+observable_states: all
