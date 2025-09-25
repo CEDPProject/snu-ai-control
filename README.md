@@ -1,6 +1,6 @@
 # SNU-AI-Control
 
-딥러닝 기반 모델 예측 제어(Model Predictive Control, MPC) 시스템 구현을 위한 PyTorch 프로젝트입니다.
+딥러닝 기반 모델 예측 제어(Model Predictive Control, MPC) 시스템 구현 목적 프레임워크입니다.
 
 ## 🚀 설치 방법
 
