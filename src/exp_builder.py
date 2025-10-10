@@ -9,6 +9,9 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 from accelerate import Accelerator
+from utils.tools import EarlyStopping, adjust_learning_rate
+from utils.metrics import cal_metric
+from utils.utils import Float32Encoder
 
 _logger = logging.getLogger('train')
 
@@ -28,11 +31,12 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count
         
-def training(
-    model, trainloader, validloader, criterion, optimizer, accelerator: Accelerator, 
-    epochs: int, eval_epochs: int, log_epochs: int, log_eval_iter: int, wandb_iter: int,
-    use_wandb: bool, ckp_metric: str, savedir: str, model_name: str, 
-    pre_training:int, early_stopping_count: int, classification: bool, return_output: bool):
+def training_dl(
+    model, trn_dataloader, val_dataloader, criterion, optimizer, accelerator: Accelerator, 
+    savedir: str, epochs: int, eval_epochs: int, log_epochs: int, log_eval_iter: int, 
+    use_wandb: bool, wandb_iter: int, ckp_metric: str, model_name: str, 
+    early_stopping_metric: str, early_stopping_count: int, lradj: int, 
+    learning_rate: int, model_config: dict, scaler_dict: dict = None):
 
     # avereage meter
     batch_time_m = AverageMeter()
@@ -41,7 +45,7 @@ def training(
 
     # set mode
     model.train()
-    optimizer.zero_grad()
+    start_training_time = time.time()
     end_time = time.time()
 
     # targets and outputs
@@ -53,60 +57,43 @@ def training(
     # init best score and step
     best_score = np.inf
     wandb_iteration = 0
+    
+    _logger.info(f"\n 🔹 Training started \n")
+    
     for epoch in range(epochs):
         epoch_time = time.time()
-        for idx, item in enumerate(trainloader):
+        
+        for idx, item in enumerate(trn_dataloader):
+            
             data_time_m.update(time.time() - end_time)
+            optimizer.zero_grad()
             
             # input
-            tabular_cat, tabular_con = item['inputs']['tabular']['cat'].type(torch.float), item['inputs']['tabular']['con'].type(torch.float)
-            tsa = item['inputs']['tsa'].type(torch.float)
-            tsb = item['inputs']['tsb'].type(torch.float)
-            target = item['targets'].type(torch.float)
-                        
-            # output
-            if model_name == 'TemporalFusionTransformer':
-                TFT_input = {'s_cat': tabular_cat.int(),
-                            's_cont': tabular_con,
-                            'k_cont': tsa,
-                            'o_cont': tsb,
-                            'targets': target}
-                outputs = model(TFT_input)
-            else:
-                outputs = model(x_cat = tabular_cat, x_cons = tabular_con, x_tsa = tsa, x_tsb = tsb)
+            input_cat = item['input']['cat']
+            input_num = item['input']['num']
+            input_ts = item['input']['ts']
+            target = item['target']['target']
+            target_ts = item['target']['ts']
             
-            # final loss
-            if pre_training:
-                target = torch.concat([tabular_cat, tabular_con, 
-                            tsa.reshape(tabular_cat.size(0),-1), 
-                            tsb.reshape(tabular_cat.size(0),-1)], axis=1)
-                
-            if classification:
-                roi_dict = get_roi_dict()
-                target = classification_label_generator(target.detach().cpu().numpy(), roi_dict)
-                target = torch.tensor(np.where(target == 1, 0, 1)).type(torch.float).cuda()
-
-                # target = torch.tensor(classification_label_generator(target.detach().cpu().numpy(), roi_dict)).type(torch.float).cuda()
-                
-                outputs = outputs.squeeze(1)
-
+            outputs = model(input_cat = input_cat, 
+                            input_num = input_num, 
+                            input_ts  = input_ts)
+            
             loss = criterion(outputs, target)
+            loss = accelerator.gather(loss).mean()
+            outputs, target = accelerator.gather_for_metrics((outputs.contiguous(), target.contiguous()))
+            
             accelerator.backward(loss)
             
             # loss update
             optimizer.step()
             optimizer.zero_grad()
+            
             losses_m.update(loss.item(), n = target.size(0))
             
             # batch time
             batch_time_m.update(time.time() - end_time)
             wandb_iteration += 1
-            
-            outputs = outputs.detach().cpu().numpy()
-            target = target.detach().cpu().numpy()
-
-            total_outputs.append(outputs)
-            total_targets.append(target)
             
             if use_wandb and (wandb_iteration+1) % wandb_iter:
                 train_results = OrderedDict([
@@ -115,35 +102,40 @@ def training(
                 ])
                 wandb.log(train_results, step=idx+1)
         
-        if (epoch+1) % log_epochs == 0:
-            _logger.info('TRAIN [{:>4d}/{}] Loss: {loss.val:>6.4f} ({loss.avg:>6.4f}) '
-                        'LR: {lr:.3e} '
-                        'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s) '
-                        'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
-                        (idx+1), 
-                        len(trainloader), 
-                        loss       = losses_m, 
-                        lr         = optimizer.param_groups[0]['lr'],
-                        batch_time = batch_time_m,
-                        rate       = tabular_cat.size(0) / batch_time_m.val,
-                        rate_avg   = tabular_cat.size(0) / batch_time_m.avg,
-                        data_time  = data_time_m))
-                
-        if (epoch+1) % eval_epochs == 0:
-            eval_metrics = test(
-                model          = model, 
-                dataloader     = validloader, 
-                criterion      = criterion,
-                name           = 'VALID',
-                log_eval_iter  = log_eval_iter,
-                pre_training   = pre_training,
-                return_output  = False,
-                savedir        = savedir,
-                model_name     = model_name,
-                accelerator    = accelerator,
-                classification = classification
+        if (epoch + 1) % log_epochs == 0:
+            _logger.info("[🚀 TRAINING Status]")
+            _logger.info(
+                'EPOCH {:>3d}/{} | TRAIN [{:>4d}/{}] Loss: {loss.val:>6.4f} ({loss.avg:>6.4f}) '
+                'LR: {lr:.3e} '
+                'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s) '
+                'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
+                    (epoch + 1), epochs,
+                    (idx + 1),
+                    len(trn_dataloader),
+                    loss=losses_m,
+                    lr=optimizer.param_groups[0]['lr'],
+                    batch_time=batch_time_m,
+                    rate=input_num.size(0) / batch_time_m.val,
+                    rate_avg=input_num.size(0) / batch_time_m.avg,
+                    data_time=data_time_m
                 )
-    
+            )
+            
+        if (epoch + 1) % eval_epochs == 0:
+            eval_metrics = test_dl(
+                accelerator   = accelerator,
+                model         = model, 
+                dataloader    = val_dataloader, 
+                criterion     = criterion,
+                name          = 'VALID',
+                log_interval  = log_eval_iter,
+                savedir       = savedir,
+                model_name    = model_name,
+                model_config  = model_config,
+                return_output = False,
+                scaler_dict   = scaler_dict
+                )
+            
             model.train()
             
             # eval results
@@ -171,21 +163,21 @@ def training(
                     torch.save(model.state_dict(), os.path.join(savedir, f'best_model.pt'))
                 
                 _logger.info('Best {0} {1:6.6f} to {2:6.6f}'.format(ckp_metric.upper(), best_score, eval_metrics[ckp_metric]))
-
+                _logger.info("\n✅ Saved best model")
+                
                 best_score = eval_metrics[ckp_metric]
                 
-            early_stopping(eval_metrics['loss'])
+            early_stopping(eval_metrics[early_stopping_metric])
             if early_stopping.early_stop:
-                print("Early stopping")
+                _logger.info("⏳ Early stopping triggered")
                 break
+            
+            adjust_learning_rate(optimizer, epoch + 1, lradj, learning_rate)
             
         end_time = time.time()
             
     # logging best score and step
     _logger.info('Best Metric: {0:6.6f} (step {1:})\n'.format(state[f'best_{ckp_metric}'], state['best_step']))
-
-    total_outputs = np.concatenate(total_outputs, axis=0)
-    total_targets = np.concatenate(total_targets, axis=0)
     
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -199,15 +191,18 @@ def training(
         state.update(eval_results)
         json.dump(state, open(os.path.join(savedir, f'latest_results.json'),'w'), indent='\t', cls=Float32Encoder)
         
-        if return_output:
-            np.save(os.path.join(savedir, f'Train_total_outputs.npy'), total_outputs)
-            np.save(os.path.join(savedir, f'Train_total_targets.npy'), total_targets)
+    # 전체 학습 시간 측정 종료
+    total_training_time = time.time() - start_training_time
+    _logger.info("\n🎉 Training complete for all datasets")    
+    return total_training_time
 
-def test(model, dataloader, criterion, accelerator: Accelerator, pre_training: int, log_eval_iter: int, 
-        savedir: str, model_name: str, name: str = 'TEST', return_output: bool = False, 
-        classification: bool = False):
+
+def test_dl(model, dataloader, criterion, accelerator: Accelerator, log_interval: int, 
+            savedir: str, model_config: dict, model_name: str, name: str = 'TEST', dataname: str = None, 
+            wandb_config: dict = None, return_output: bool = False, plot_result:bool = False, 
+            training_time = None, scaler_dict = None) -> dict:
     
-    _logger.info('\n[Start {}]'.format(name))
+    _logger.info(f'\n[🔍 Start {name} Evaluation]')
     
     # avereage meter
     batch_time_m = AverageMeter()
@@ -227,44 +222,20 @@ def test(model, dataloader, criterion, accelerator: Accelerator, pre_training: i
             data_time_m.update(time.time() - end_time)
             
             # input
-            tabular_cat, tabular_con = item['inputs']['tabular']['cat'].type(torch.float), item['inputs']['tabular']['con'].type(torch.float)
-            tsa = item['inputs']['tsa'].type(torch.float)
-            tsb = item['inputs']['tsb'].type(torch.float)
-            target = item['targets'].type(torch.float)
+            input_cat = item['input']['cat']
+            input_num = item['input']['num']
+            input_ts = item['input']['ts']
+            target = item['target']['target']
+            target_ts = item['target']['ts']
             
-            # output
-            if model_name == 'TemporalFusionTransformer':
-                TFT_input = {'s_cat': tabular_cat.int(),
-                            's_cont': tabular_con,
-                            'k_cont': tsa,
-                            'o_cont': tsb,
-                            'targets': target}
-                outputs = model(TFT_input)
-                
-            else:
-                outputs = model(x_cat = tabular_cat, x_cons = tabular_con, x_tsa = tsa, x_tsb = tsb)
-
-            # final loss
-            if pre_training:
-                target = torch.concat([tabular_cat, tabular_con, 
-                            tsa.reshape(tabular_cat.size(0),-1), 
-                            tsb.reshape(tabular_cat.size(0),-1)], axis=1)
-                
-            if classification:
-                roi_dict = get_roi_dict()
-                target = classification_label_generator(target.detach().cpu().numpy(), roi_dict)
-                target = torch.tensor(np.where(target == 1, 0, 1)).type(torch.float).cuda()
-
-                # target = torch.tensor(classification_label_generator(target.detach().cpu().numpy(), roi_dict)).type(torch.float).cuda()
-                outputs = outputs.squeeze(1)
-                
-            # final loss
+            outputs = model(input_cat = input_cat, 
+                            input_num = input_num, 
+                            input_ts  = input_ts)
+            
             loss = criterion(outputs, target)
-
-            loss = accelerator.gather(loss)
-            loss = torch.mean(loss)
-            
+            loss = accelerator.gather(loss).mean()
             outputs, target = accelerator.gather_for_metrics((outputs.contiguous(), target.contiguous()))
+            
             losses_m.update(loss.item(), n=target.size(0))
                         
             outputs = outputs.detach().cpu().numpy()
@@ -276,7 +247,7 @@ def test(model, dataloader, criterion, accelerator: Accelerator, pre_training: i
             # batch time        
             batch_time_m.update(time.time() - end_time)
             
-            if (idx+1) % log_eval_iter == 0:
+            if (idx+1) % log_interval == 0:
                 _logger.info('{name} [{:>4d}/{}] Loss: {loss.val:>6.4f} ({loss.avg:>6.4f}) '
                             'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s) '
                             'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
@@ -285,34 +256,59 @@ def test(model, dataloader, criterion, accelerator: Accelerator, pre_training: i
                             name       = name,
                             loss       = losses_m, 
                             batch_time = batch_time_m,
-                            rate       = tabular_cat.size(0) / batch_time_m.val,
-                            rate_avg   = tabular_cat.size(0) / batch_time_m.avg,
+                            rate       = input_num.size(0) / batch_time_m.val,
+                            rate_avg   = input_num.size(0) / batch_time_m.avg,
                             data_time  = data_time_m))
                 
             end_time = time.time()
     
     total_outputs = np.concatenate(total_outputs, axis=0)
     total_targets = np.concatenate(total_targets, axis=0)
-    print(f'{name} shape:', total_outputs.shape, total_targets.shape)
+    print(f'{name} shape (normalized):', total_outputs.shape, total_targets.shape)
+    
+    # Denormalization
+    if scaler_dict is not None and 'target_scaler' in scaler_dict:
+        target_scaler = scaler_dict['target_scaler']
+        
+        # shape: (n_samples, pred_len, n_target) -> (n_samples * pred_len, n_target)
+        original_shape = total_outputs.shape
+        
+        # Denormalize outputs
+        total_outputs_denorm = target_scaler.inverse_transform(
+            total_outputs.reshape(-1, original_shape[-1])
+        ).reshape(original_shape)
+        
+        # Denormalize targets
+        total_targets_denorm = target_scaler.inverse_transform(
+            total_targets.reshape(-1, original_shape[-1])
+        ).reshape(original_shape)
+        
+        print(f'{name} shape (denormalized):', total_outputs_denorm.shape, total_targets_denorm.shape)
+        
+        # Use denormalized values for metric calculation
+        pred_for_metric = total_outputs_denorm
+        true_for_metric = total_targets_denorm
+    else:
+        _logger.warning('⚠️  No target_scaler found. Computing metrics on normalized values.')
+        pred_for_metric = total_outputs
+        true_for_metric = total_targets
     
     results = OrderedDict([('loss',losses_m.avg)])
     
-    if classification:
-        total_outputs = torch.Tensor(total_outputs).unsqueeze(1)
-        probs = torch.sigmoid(total_outputs)
-        binary_outputs = (probs >= 0.5).float()
-        binary_outputs = np.array(binary_outputs.squeeze())
-        metrics = cal_classification_metric(pred=binary_outputs, true=total_targets)
-    else:
-        metrics = cal_metric(pred = total_outputs, true = total_targets)
-        result_generator_SFR = ResultGeneratorSFR(total_outputs.reshape(total_outputs.shape[0], -1), 
-                                                total_targets.reshape(total_targets.shape[0], -1), 
-                                                './output/SFR')
-        LG_result_dict = result_generator_SFR.calc_acc_sfr()
-        results.update([(f'{k}', m) for k, m in LG_result_dict.items()])
+    # Calculate metrics on denormalized values
+    metrics = cal_metric(pred=pred_for_metric, true=true_for_metric)
+    
+    results.update([(f'{k}', m) for k, m in metrics.items()])
     
     # logging metrics
-    _logger.info("\n{}: ".format(name) + " ".join('{}: {}'.format(k.upper(), m) for k, m in metrics.items()) + "\n")
+    _logger.info(
+        "\n{}: ".format(name) +
+        " ".join(
+            "{}: {:.4f}".format(k.upper(), v) if isinstance(v, (int, float)) and v is not None 
+            else "{}: {}".format(k.upper(), v if v is not None else "N/A")
+            for k, v in metrics.items()
+        ) + "\n"
+    )
     
     # return results
     results.update([(f'{k}', m) for k, m in metrics.items()])
@@ -321,6 +317,12 @@ def test(model, dataloader, criterion, accelerator: Accelerator, pre_training: i
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         if return_output:
-            np.save(os.path.join(savedir, f'{name}_total_outputs.npy'), total_outputs)
-            np.save(os.path.join(savedir, f'{name}_total_targets.npy'), total_targets)
+            # Save denormalized values if available
+            if scaler_dict is not None and 'target_scaler' in scaler_dict:
+                np.save(os.path.join(savedir, f'{name}_total_outputs.npy'), total_outputs_denorm)
+                np.save(os.path.join(savedir, f'{name}_total_targets.npy'), total_targets_denorm)
+            else:
+                np.save(os.path.join(savedir, f'{name}_total_outputs.npy'), total_outputs)
+                np.save(os.path.join(savedir, f'{name}_total_targets.npy'), total_targets)
+            
     return results

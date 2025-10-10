@@ -4,12 +4,20 @@ import pandas as pd
 from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder, StandardScaler, MinMaxScaler
 import warnings
 
+import os
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder, StandardScaler, MinMaxScaler
+import warnings
+
 def load_dataset(
                 datadir: str,
                 scaler: str,
                 ord_categorical_feature: list,
                 categorical_feature: list,
+                cat_encode_method: str,
                 numerical_feature: list,
+                target_features: list,
                 data_version: str,
                 environment_name: str,
                 split_rate: list = [0.8, 0.1, 0.1],
@@ -29,9 +37,20 @@ def load_dataset(
     df_raw['데이터 시간'] = pd.to_datetime(df_raw['데이터 시간'])
     df_raw = df_raw.sort_values('데이터 시간', ascending=True)
     
+    # timestamp 별도 저장
+    timestamps = df_raw['데이터 시간'].copy()
+    
     # 삭제할 컬럼 제거
     if del_feature is not None:
         df_raw = df_raw.drop(columns=del_feature, errors='ignore')
+    
+    # 이상치 clipping
+    clip_thresholds = {
+                    '환기유효전력(W)': 1000,
+                    '냉난방유효전력(W)': 1000
+                }
+    if clip_thresholds is not None:
+        df_raw = clip_target_outliers(df_raw, target_features, clip_thresholds)
         
     # 2. 결측치 처리
     df_raw = handle_missing_values(df_raw, ord_categorical_feature, 
@@ -42,23 +61,25 @@ def load_dataset(
         df_raw,
         ord_categorical_feature,
         categorical_feature,
-        numerical_feature
+        numerical_feature,
+        cat_encode_method
     )
     
-    # 4. 데이터 분할
+    # 4. 데이터 분할 (timestamp도 함께 분할)
     if split_date is not None:
         # 날짜 기준 분할
-        data_dict = split_by_date(encoded_df, df_raw['데이터 시간'], 
-                                    split_date, start_date, end_date)
+        data_dict = split_by_date(encoded_df, timestamps, 
+                                    split_date, split_rate, start_date, end_date)
     else:
         # 비율 기준 분할
-        data_dict = split_by_ratio(encoded_df, split_rate)
+        data_dict = split_by_ratio(encoded_df, timestamps, split_rate)
     
-    # 5. 스케일링
+    # 5. 스케일링 (timestamp는 제외)
     scaler_dict = {}
     if scaler is not None:
-        data_dict, scaler = apply_scaling(data_dict, scaler, feature_names)
+        data_dict, scaler, target_scaler = apply_scaling(data_dict, scaler, feature_names, target_features)
         scaler_dict['scaler'] = scaler
+        scaler_dict['target_scaler'] = target_scaler
     
     # 인코더 저장
     scaler_dict['encoders'] = encoders
@@ -74,10 +95,95 @@ def load_dataset(
     
     return data_dict, feature_names, scaler_dict
 
+def clip_target_outliers(df_raw, target_features, clip_thresholds=None):
+    """
+    Target feature의 극단적 이상치를 clipping으로 제거
+    
+    Args:
+        df_raw: 원본 DataFrame
+        target_features: target feature 이름 리스트
+        clip_thresholds: dict or float
+            - dict: {feature_name: threshold} 형태로 각 feature별 threshold 지정
+            - float: 모든 feature에 동일한 threshold 적용
+            - None: 자동으로 99.9 percentile 사용
+    
+    Returns:
+        df_raw: clipping이 적용된 DataFrame
+    """
+    
+    print("\n" + "=" * 75)
+    print("TARGET FEATURE OUTLIER CLIPPING".center(75))
+    print("=" * 75)
+    
+    for target_feat in target_features:
+        if target_feat not in df_raw.columns:
+            warnings.warn(f"Target feature '{target_feat}' not found in data")
+            continue
+        
+        # 숫자로 변환 (문자열이 있을 수 있음)
+        df_raw[target_feat] = pd.to_numeric(df_raw[target_feat], errors='coerce')
+        
+        original_data = df_raw[target_feat].copy()
+        
+        # NaN 제거하고 통계 계산
+        valid_data = original_data.dropna()
+        
+        if len(valid_data) == 0:
+            warnings.warn(f"Target feature '{target_feat}' has no valid numeric data")
+            continue
+        
+        # Threshold 결정
+        if clip_thresholds is None:
+            # 자동: 99.9 percentile 사용
+            threshold = np.percentile(valid_data, 99.9)
+            print(f"\n[{target_feat}] Auto threshold (p99.9): {threshold:,.0f}")
+        elif isinstance(clip_thresholds, dict):
+            # Dictionary에서 해당 feature의 threshold 가져오기
+            threshold = clip_thresholds.get(target_feat)
+            if threshold is None:
+                threshold = np.percentile(valid_data, 99.9)
+                print(f"\n[{target_feat}] No threshold specified, using p99.9: {threshold:,.0f}")
+            else:
+                print(f"\n[{target_feat}] Manual threshold: {threshold:,.0f}")
+        else:
+            # 모든 feature에 동일한 threshold
+            threshold = clip_thresholds
+            print(f"\n[{target_feat}] Manual threshold: {threshold:,.0f}")
+        
+        # 통계 출력
+        print(f"  Before clipping:")
+        print(f"    Min: {valid_data.min():,.0f}")
+        print(f"    Max: {valid_data.max():,.0f}")
+        print(f"    Mean: {valid_data.mean():,.0f}")
+        print(f"    Valid samples: {len(valid_data):,} / {len(original_data):,}")
+        
+        # Clipping 적용
+        df_raw[target_feat] = df_raw[target_feat].clip(upper=threshold)
+        
+        # 변경된 값 개수
+        clipped_count = (valid_data > threshold).sum()
+        clipped_rate = clipped_count / len(valid_data) * 100 if len(valid_data) > 0 else 0
+        
+        print(f"  After clipping:")
+        print(f"    Max: {df_raw[target_feat].max():,.0f}")
+        print(f"    Clipped: {clipped_count:,} values ({clipped_rate:.2f}%)")
+        
+        if clipped_count > 0:
+            outlier_samples = valid_data[valid_data > threshold].values[:5]
+            print(f"    Clipped values (sample): {[f'{v:,.0f}' for v in outlier_samples]}")
+    
+    print("=" * 75 + "\n")
+    
+    return df_raw
 
-def encode_features(df, ord_categorical_feature, categorical_feature, numerical_feature):
+def encode_features(df, ord_categorical_feature, categorical_feature, numerical_feature, cat_encode_method='onehot'):
     """
     Feature 인코딩 처리
+    
+    Args:
+        cat_encode_method (str): categorical feature 인코딩 방법
+            - 'onehot': One-hot encoding (default)
+            - 'label': Label encoding (0-1 normalized for SSM stability)
     
     Returns:
         encoded_df: 인코딩된 DataFrame
@@ -113,28 +219,49 @@ def encode_features(df, ord_categorical_feature, categorical_feature, numerical_
                 encoded_val = encoded_val / (len(encoder.categories_[0]) - 1)
             
             encoded_parts.append(encoded_val)
-            feature_names.append(f"{col}_ord")
+            feature_names.append(f"{col}")
             ord_encoder_dict[col] = encoder
         
         encoders['ordinal'] = ord_encoder_dict
     
-    # 2. Nominal Categorical 인코딩 (One-hot)
+    # 2. Nominal Categorical 인코딩
     if categorical_feature:
-        # Drop first to avoid multicollinearity
-        # onehot_encoder = OneHotEncoder(sparse_output=False, drop='first')
-        onehot_encoder = OneHotEncoder(sparse_output=False, drop=None)
-        
         valid_cat_features = [col for col in categorical_feature if col in df.columns]
         
         if valid_cat_features:
-            onehot_encoded = onehot_encoder.fit_transform(df[valid_cat_features])
-            encoded_parts.append(onehot_encoded)
-            
-            # Feature 이름 생성
-            onehot_names = onehot_encoder.get_feature_names_out(valid_cat_features)
-            feature_names.extend(onehot_names)
-            
-            encoders['nominal'] = onehot_encoder
+            if cat_encode_method == 'onehot':
+                # One-hot encoding
+                onehot_encoder = OneHotEncoder(sparse_output=False, drop=None)
+                onehot_encoded = onehot_encoder.fit_transform(df[valid_cat_features])
+                encoded_parts.append(onehot_encoded)
+                
+                # Feature 이름 생성
+                onehot_names = onehot_encoder.get_feature_names_out(valid_cat_features)
+                feature_names.extend(onehot_names)
+                
+                encoders['nominal'] = onehot_encoder
+                
+            elif cat_encode_method == 'label':
+                # Label encoding
+                label_encoder_dict = {}
+                
+                for col in valid_cat_features:
+                    # OrdinalEncoder 사용 (LabelEncoder보다 일관성 있음)
+                    encoder = OrdinalEncoder()
+                    encoded_val = encoder.fit_transform(df[[col]])
+                    
+                    # 0-1 범위로 정규화 (SSM 안정성)
+                    if len(encoder.categories_[0]) > 1:
+                        encoded_val = encoded_val / (len(encoder.categories_[0]) - 1)
+                    
+                    encoded_parts.append(encoded_val)
+                    feature_names.append(f"{col}")
+                    label_encoder_dict[col] = encoder
+                
+                encoders['nominal'] = label_encoder_dict
+                
+            else:
+                raise ValueError(f"Unknown cat_encode_method: {cat_encode_method}. Use 'onehot' or 'label'")
     
     # 3. Numerical features
     if numerical_feature:
@@ -161,11 +288,7 @@ def get_ordinal_mappings(column_name):
     실제 데이터에 맞게 수정 필요
     """
     ordinal_maps = {
-        '팬속도': ['정지', '저속', '중속', '고속'],
-        '댐퍼개도': ['닫힘', '25%', '50%', '75%', '100%'],
-        '운전모드': ['정지', '냉방', '난방', '송풍', '제습'],
         '온도설정': ['18', '19', '20', '21', '22', '23', '24', '25', '26'],
-        # 추가 매핑 정의...
     }
     
     return ordinal_maps.get(column_name, None)
@@ -374,15 +497,16 @@ def _handle_ordinal_missing(df, features, method):
     return df
 
 
-def apply_scaling(data_dict, scaler_method, feature_names):
+def apply_scaling(data_dict, scaler_method, feature_names, target_features):
     """
     학습/검증/테스트 데이터에 동일한 스케일링 적용
+    (timestamp는 제외하고 스케일링)
     
     Args:
         data_dict (dict): 
             분할된 데이터셋 딕셔너리
             - keys: 'train', 'val', 'test'
-            - values: numpy array 형태의 데이터 (n_samples, n_features)
+            - values: {'data': numpy array, 'timestamps': numpy array}
             
         scaler_method (str): 
             스케일링 방법 선택
@@ -392,7 +516,6 @@ def apply_scaling(data_dict, scaler_method, feature_names):
             
         feature_names (list): 
             각 feature의 이름 리스트 (디버깅/로깅용)
-            예: ['온도_scaled', '습도_scaled', '모드_onehot_1']
     
     Returns:
         tuple: (data_dict, scaler)
@@ -404,203 +527,249 @@ def apply_scaling(data_dict, scaler_method, feature_names):
         scaler = StandardScaler()
     elif scaler_method == 'minmax':
         scaler = MinMaxScaler()
-    elif scaler_method == 'minmax_square':
-        scaler = MinMaxScaler(feature_range=(0, 1))
     else:
         raise ValueError(f"Unknown scaling method: {scaler_method}")
     
-    scaler.fit(data_dict['train'])
+    # train 데이터로 scaler fit
+    scaler.fit(data_dict['train']['data'])
     
+    # 데이터 스케일링
     for key in data_dict:
-        data_dict[key] = scaler.transform(data_dict[key])
+        data_dict[key]['data'] = scaler.transform(data_dict[key]['data'])
     
-    return data_dict, scaler
+    # target_scaler는 전체 scaler의 파라미터에서 target 부분만 추출
+    target_indices = [feature_names.index(tf) for tf in target_features]
+    
+    if scaler_method == 'standard':
+        target_scaler = StandardScaler()
+        target_scaler.mean_ = scaler.mean_[target_indices]
+        target_scaler.scale_ = scaler.scale_[target_indices]
+    else:  # minmax
+        target_scaler = MinMaxScaler(feature_range=(0, 1))
+        target_scaler.min_ = scaler.min_[target_indices]
+        target_scaler.scale_ = scaler.scale_[target_indices]
+        target_scaler.data_min_ = scaler.data_min_[target_indices]
+        target_scaler.data_max_ = scaler.data_max_[target_indices]
+        target_scaler.data_range_ = scaler.data_range_[target_indices]
+    
+    target_scaler.n_features_in_ = len(target_indices)
+        
+    return data_dict, scaler, target_scaler
 
-
-def split_by_date(encoded_df, date_column, split_date, start_date=None, end_date=None):
+def split_by_date(encoded_df, timestamps, split_date, split_rate=[0.8, 0.1, 0.1],
+                  start_date=None, end_date=None):
     """
-    시계열 데이터를 날짜 또는 비율 기준으로 train/val/test 분할
-    
-    Args:
-        encoded_df (pd.DataFrame)
-        date_column (pd.Series)
-        split_date (str or float or tuple): 
-            Train/Val/Test 분할 기준
-            
-        start_date (str, optional): 
-            데이터 사용 시작 날짜 (None이면 데이터 처음부터)
-            
-        end_date (str, optional): 
-            데이터 사용 종료 날짜 (None이면 데이터 끝까지)
-    
-    Returns:
-        dict: 분할된 데이터 딕셔너리
-            - 'train': 학습 데이터 (numpy array)
-            - 'val': 검증 데이터 (numpy array)
-            - 'test': 테스트 데이터 (numpy array)
+    시계열 데이터를 2단계로 train/val/test 분할 (timestamp 포함)
     """
     
-    # 시작/종료 날짜 처리
-    if start_date is None:
-        start_datetime = date_column.min()
-    else:
-        start_datetime = pd.to_datetime(start_date)
+    # 1. 날짜 범위 설정
+    start_dt, end_dt = _get_date_range(timestamps, start_date, end_date)
     
-    if end_date is None:
-        end_datetime = date_column.max()
-    else:
-        end_datetime = pd.to_datetime(end_date)
+    # 2. split_rate 분리
+    train_ratio, val_ratio = split_rate[0], split_rate[1]
     
-    # 유효한 데이터 범위 필터링
-    valid_mask = (date_column >= start_datetime) & (date_column <= end_datetime)
-    valid_dates = date_column[valid_mask]
+    # 3. split_date로 train+val과 test 분할점 계산
+    trainval_end = _calculate_trainval_split_point(split_date, start_dt, end_dt)
     
-    if len(valid_dates) == 0:
-        raise ValueError(f"No data between {start_date} and {end_date}")
+    # 4. 1단계 분할: (train+val) vs test
+    trainval_data, trainval_timestamps, test_data, test_timestamps = _split_trainval_test(
+        encoded_df, timestamps, start_dt, trainval_end, end_dt
+    )
     
-    # split_date 타입에 따른 처리
-    if isinstance(split_date, str):
-        # 날짜로 분할
-        split_datetime = pd.to_datetime(split_date)
-        
-        # 유효성 검사
-        if start_datetime >= split_datetime:
-            raise ValueError(f"start_date ({start_date}) must be before split_date ({split_date})")
-        if split_datetime >= end_datetime:
-            raise ValueError(f"split_date ({split_date}) must be before end_date ({end_date})")
-        
-        # Train: start_date ~ split_date
-        train_mask = (date_column >= start_datetime) & (date_column < split_datetime)
-        
-        # Val과 Test를 위한 중간 지점 계산 (50:50)
-        val_end = split_datetime + (end_datetime - split_datetime) / 2
-        
-        # Val: split_date ~ 중간지점
-        val_mask = (date_column >= split_datetime) & (date_column < val_end)
-        
-        # Test: 중간지점 ~ end_date
-        test_mask = (date_column >= val_end) & (date_column <= end_datetime)
-        
-        # 분할 정보
-        train_start, train_end = start_datetime, split_datetime
-        val_start, val_end_time = split_datetime, val_end
-        test_start, test_end = val_end, end_datetime
-        
-    elif isinstance(split_date, (int, float)):
-        # 단일 비율로 분할
-        if not 0 < split_date < 1:
-            raise ValueError(f"split_date ratio must be between 0 and 1, got {split_date}")
-        
-        train_ratio = split_date
-        # 나머지를 val과 test가 균등 분할
-        remaining_ratio = 1 - train_ratio
-        val_ratio = remaining_ratio / 2
-        test_ratio = remaining_ratio / 2
-        
-        # 시간 기반 분할점 계산
-        total_duration = end_datetime - start_datetime
-        train_end = start_datetime + total_duration * train_ratio
-        val_end_time = start_datetime + total_duration * (train_ratio + val_ratio)
-        
-        # 마스크 생성
-        train_mask = (date_column >= start_datetime) & (date_column < train_end)
-        val_mask = (date_column >= train_end) & (date_column < val_end_time)
-        test_mask = (date_column >= val_end_time) & (date_column <= end_datetime)
-        
-        # 분할 정보
-        train_start = start_datetime
-        val_start = train_end
-        test_start = val_end_time
-        test_end = end_datetime
-        
-    elif isinstance(split_date, (tuple, list)):
-        # (train_ratio, val_ratio) 형태로 분할
-        if len(split_date) != 2:
-            raise ValueError(f"split_date tuple must have 2 values (train_ratio, val_ratio), got {len(split_date)}")
-        
-        train_ratio, val_ratio = split_date
-        test_ratio = 1 - train_ratio - val_ratio
-        
-        if test_ratio < 0:
-            raise ValueError(f"train_ratio ({train_ratio}) + val_ratio ({val_ratio}) must be <= 1")
-        
-        if any(r < 0 for r in [train_ratio, val_ratio, test_ratio]):
-            raise ValueError(f"All ratios must be >= 0")
-        
-        # 시간 기반 분할점 계산
-        total_duration = end_datetime - start_datetime
-        train_end = start_datetime + total_duration * train_ratio
-        val_end_time = start_datetime + total_duration * (train_ratio + val_ratio)
-        
-        # 마스크 생성
-        train_mask = (date_column >= start_datetime) & (date_column < train_end)
-        val_mask = (date_column >= train_end) & (date_column < val_end_time)
-        test_mask = (date_column >= val_end_time) & (date_column <= end_datetime)
-        
-        # 분할 정보
-        train_start = start_datetime
-        val_start = train_end
-        test_start = val_end_time
-        test_end = end_datetime
-        
-    else:
-        raise ValueError(f"split_date must be str, float, or tuple, got {type(split_date)}")
+    # 5. 2단계 분할: train vs val
+    train_data, train_timestamps, val_data, val_timestamps = _split_train_val(
+        trainval_data, trainval_timestamps, train_ratio, val_ratio
+    )
     
-    # 데이터 분할
+    # 6. 결과 딕셔너리 생성
     data_dict = {
-        'train': encoded_df[train_mask].values,
-        'val': encoded_df[val_mask].values,
-        'test': encoded_df[test_mask].values
+        'train': {'data': train_data, 'timestamps': train_timestamps},
+        'val': {'data': val_data, 'timestamps': val_timestamps},
+        'test': {'data': test_data, 'timestamps': test_timestamps}
     }
     
-    # 분할 정보 출력
-    print(f"Data split summary:")
-    print(f"  Train: {train_start.strftime('%Y-%m-%d %H:%M')} ~ {train_end.strftime('%Y-%m-%d %H:%M')} ({len(data_dict['train'])} samples)")
-    print(f"  Val:   {val_start.strftime('%Y-%m-%d %H:%M')} ~ {val_end_time.strftime('%Y-%m-%d %H:%M')} ({len(data_dict['val'])} samples)")
-    print(f"  Test:  {test_start.strftime('%Y-%m-%d %H:%M')} ~ {test_end.strftime('%Y-%m-%d %H:%M')} ({len(data_dict['test'])} samples)")
-    
-    # 비율로 분할한 경우 실제 비율 출력
-    if isinstance(split_date, (int, float, tuple, list)):
-        total_samples = len(data_dict['train']) + len(data_dict['val']) + len(data_dict['test'])
-        if total_samples > 0:
-            actual_train_ratio = len(data_dict['train']) / total_samples
-            actual_val_ratio = len(data_dict['val']) / total_samples
-            actual_test_ratio = len(data_dict['test']) / total_samples
-            print(f"  Actual ratios: Train={actual_train_ratio:.1%}, Val={actual_val_ratio:.1%}, Test={actual_test_ratio:.1%}")
-    
-    if len(data_dict['train']) == 0:
-        print("⚠️  Warning: Train set is empty!")
-    if len(data_dict['val']) == 0:
-        print("⚠️  Warning: Validation set is empty!")
-    if len(data_dict['test']) == 0:
-        print("⚠️  Warning: Test set is empty!")
+    # 7. 정보 출력
+    _print_two_stage_split_summary(
+        data_dict, start_dt, trainval_end, end_dt, 
+        train_ratio, val_ratio
+    )
     
     return data_dict
 
 
-def split_by_ratio(encoded_df, split_rate):
-    """
-    데이터를 지정된 비율로 train/val/test 분할
+def _get_date_range(timestamps, start_date, end_date):
+    """날짜 범위 설정"""
+    start_dt = pd.to_datetime(start_date) if start_date else timestamps.min()
+    end_dt = pd.to_datetime(end_date) if end_date else timestamps.max()
     
-    Args:
-        encoded_df (pd.DataFrame)
-        split_rate (list of float): [train_ratio, val_ratio, test_ratio] 형태의 분할 비율
+    valid_mask = (timestamps >= start_dt) & (timestamps <= end_dt)
+    if valid_mask.sum() == 0:
+        raise ValueError(f"No data between {start_date} and {end_date}")
     
-    Returns:
-        dict: 분할된 데이터 딕셔너리
-            - 'train': 전체 데이터의 앞부분 (numpy array)
-            - 'val': 중간 부분 (numpy array)  
-            - 'test': 뒷부분 (numpy array)
+    return start_dt, end_dt
+
+
+def _calculate_trainval_split_point(split_date, start_dt, end_dt):
+    """train+val과 test의 분할점 계산"""
+    if isinstance(split_date, str):
+        trainval_end = pd.to_datetime(split_date)
+        
+        if not (start_dt < trainval_end < end_dt):
+            raise ValueError(
+                f"split_date ({split_date}) must be between "
+                f"start_date ({start_dt:%Y-%m-%d}) and end_date ({end_dt:%Y-%m-%d})"
+            )
+    
+    elif isinstance(split_date, (int, float)):
+        if not 0 < split_date < 1:
+            raise ValueError(f"split_date ratio must be in (0, 1), got {split_date}")
+        
+        total_duration = end_dt - start_dt
+        trainval_end = start_dt + total_duration * split_date
+    
+    else:
+        raise ValueError(f"split_date must be str or float, got {type(split_date).__name__}")
+    
+    return trainval_end
+
+
+def _split_trainval_test(encoded_df, timestamps, start_dt, trainval_end, end_dt):
+    """1단계 분할: (train+val) vs test"""
+    
+    # 마스크 생성
+    trainval_mask = (timestamps >= start_dt) & (timestamps < trainval_end)
+    test_mask = (timestamps >= trainval_end) & (timestamps <= end_dt)
+    
+    # 데이터 추출
+    trainval_data = encoded_df[trainval_mask].values
+    trainval_timestamps = timestamps[trainval_mask].values
+    test_data = encoded_df[test_mask].values
+    test_timestamps = timestamps[test_mask].values
+    
+    return trainval_data, trainval_timestamps, test_data, test_timestamps
+
+
+def _split_train_val(trainval_data, trainval_timestamps, train_ratio, val_ratio):
+    """2단계 분할: train vs val"""
+    
+    n_trainval = len(trainval_data)
+    train_size = int(n_trainval * train_ratio)
+    
+    # 분할
+    train_data = trainval_data[:train_size]
+    train_timestamps = trainval_timestamps[:train_size]
+    val_data = trainval_data[train_size:]
+    val_timestamps = trainval_timestamps[train_size:]
+    
+    return train_data, train_timestamps, val_data, val_timestamps
+
+
+def _print_two_stage_split_summary(data_dict, start_dt, trainval_end, end_dt, 
+                                    train_ratio, val_ratio):
+    """2단계 분할 정보 출력"""
+    print("\n" + "=" * 75)
+    print("TWO-STAGE DATA SPLIT SUMMARY".center(75))
+    print("=" * 75)
+    
+    # Stage 1: train+val vs test
+    print("\n[STAGE 1] Train+Val vs Test Split")
+    print("-" * 75)
+    print(f"  Train+Val: {start_dt:%Y-%m-%d %H:%M} ~ {trainval_end:%Y-%m-%d %H:%M}")
+    print(f"  Test:      {trainval_end:%Y-%m-%d %H:%M} ~ {end_dt:%Y-%m-%d %H:%M}")
+    
+    trainval_samples = len(data_dict['train']['data']) + len(data_dict['val']['data'])
+    test_samples = len(data_dict['test']['data'])
+    stage1_total = trainval_samples + test_samples
+    
+    if stage1_total > 0:
+        print(f"\n  Train+Val: {trainval_samples:,} samples ({trainval_samples/stage1_total:6.2%})")
+        print(f"  Test:      {test_samples:,} samples ({test_samples/stage1_total:6.2%})")
+    
+    # Stage 2: train vs val
+    print(f"\n[STAGE 2] Train vs Val Split (from Train+Val data)")
+    print("-" * 75)
+    print(f"  Split Ratio: Train={train_ratio:.1%}, Val={val_ratio:.1%}")
+    
+    if trainval_samples > 0:
+        actual_train_ratio = len(data_dict['train']['data']) / trainval_samples
+        actual_val_ratio = len(data_dict['val']['data']) / trainval_samples
+        
+        print(f"\n  Train: {len(data_dict['train']['data']):,} samples ({actual_train_ratio:6.2%} of Train+Val)")
+        print(f"  Val:   {len(data_dict['val']['data']):,} samples ({actual_val_ratio:6.2%} of Train+Val)")
+    
+    # Final Summary
+    print(f"\n[FINAL] Overall Split")
+    print("-" * 75)
+    
+    total = sum(len(v['data']) for v in data_dict.values())
+    if total > 0:
+        for name in ['train', 'val', 'test']:
+            count = len(data_dict[name]['data'])
+            ratio = count / total
+            print(f"  {name.capitalize():5s}: {count:,} samples ({ratio:6.2%} of total)")
+    
+    # 경고
+    warnings_list = []
+    if trainval_samples == 0:
+        warnings_list.append("⚠️  Train+Val set is EMPTY!")
+    if len(data_dict['train']['data']) == 0:
+        warnings_list.append("⚠️  TRAIN set is EMPTY!")
+    if len(data_dict['val']['data']) == 0:
+        warnings_list.append("⚠️  VAL set is EMPTY!")
+    if len(data_dict['test']['data']) == 0:
+        warnings_list.append("⚠️  TEST set is EMPTY!")
+    
+    if warnings_list:
+        print("\n" + "-" * 75)
+        print("WARNINGS:")
+        for warning in warnings_list:
+            print(f"  {warning}")
+    
+    print("=" * 75 + "\n")
+
+
+def split_by_ratio(encoded_df, timestamps, split_rate):
     """
+    데이터를 지정된 비율로 train/val/test 분할 (timestamp 포함)
+    """
+    
+    train_ratio, val_ratio, test_ratio = split_rate
     
     n_samples = len(encoded_df)
-    train_size = int(n_samples * split_rate[0])
-    val_size = int(n_samples * split_rate[1])
     
+    # 분할 인덱스 계산
+    train_size = int(n_samples * train_ratio)
+    val_size = int(n_samples * val_ratio)
+    
+    # 데이터 분할
     data_dict = {
-        'train': encoded_df.iloc[:train_size].values,
-        'val': encoded_df.iloc[train_size:train_size+val_size].values,
-        'test': encoded_df.iloc[train_size+val_size:].values
+        'train': {
+            'data': encoded_df.iloc[:train_size].values,
+            'timestamps': timestamps.iloc[:train_size].values
+        },
+        'val': {
+            'data': encoded_df.iloc[train_size:train_size+val_size].values,
+            'timestamps': timestamps.iloc[train_size:train_size+val_size].values
+        },
+        'test': {
+            'data': encoded_df.iloc[train_size+val_size:].values,
+            'timestamps': timestamps.iloc[train_size+val_size:].values
+        }
     }
+    
+    # 정보 출력
+    print("\n" + "=" * 70)
+    print("DATA SPLIT SUMMARY (Index-based)".center(70))
+    print("=" * 70)
+    
+    total = n_samples
+    for name, data in data_dict.items():
+        ratio = len(data['data']) / total if total > 0 else 0
+        print(f"  {name.capitalize():5s}: {len(data['data']):,} samples ({ratio:6.2%})")
+    
+    if any(len(data['data']) == 0 for data in data_dict.values()):
+        print(f"\n  ⚠️  WARNING: Some splits are empty!")
+    
+    print("=" * 70 + "\n")
     
     return data_dict

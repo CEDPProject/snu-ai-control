@@ -8,4 +8,72 @@ MPCController:
   power_weight: 1.0
   comfort_weight: 0.5
   control_change_weight: 0.1
-observable_states: all
+  observable_states: all
+
+DLinear:
+  individual: false              # true: per-variate linear layers, false: shared layers
+  moving_avg: 25                 # kernel size for seasonal-trend decomposition
+  cat_emb_dim: 8                 # embedding dimension per categorical feature
+
+iTransformer:
+  d_model: 128                   # model dimension
+  n_heads: 8                     # number of attention heads
+  e_layers: 2                    # number of encoder layers
+  d_ff: 256                      # feedforward dimension
+  dropout: 0.1                   # dropout rate
+  activation: 'gelu'             # activation function: 'gelu' or 'relu'
+  factor: 1                      # attention factor (for ProbSparse attention)
+  embed: 'fixed'                 # time features encoding: 'fixed', 'timeF', 'learned'
+  freq: 'h'                      # freq for time features: 's', 't', 'h', 'd', 'b', 'w', 'm'
+  cat_emb_dim: 8                 # embedding dimension per categorical feature
+
+MICN:
+  d_model: 128                   # model dimension
+  n_heads: 8                     # number of attention heads (for MIC layers)
+  e_layers: 2                    # number of encoder layers
+  d_ff: 256                      # feedforward dimension
+  d_layers: 1                    # number of MIC layers
+  dropout: 0.05                  # dropout rate
+  embed: 'fixed'                 # time features encoding
+  freq: 'h'                      # freq for time features
+  conv_kernel: [12, 16]          # downsampling/upsampling convolution kernels
+  cat_emb_dim: 8                 # embedding dimension per categorical feature
+
+PatchTST:
+  d_model: 128                   # model dimension
+  n_heads: 8                     # number of attention heads
+  e_layers: 3                    # number of encoder layers
+  d_ff: 256                      # feedforward dimension
+  dropout: 0.1                   # dropout rate
+  activation: 'gelu'             # activation function
+  factor: 1                      # attention factor
+  embed: 'fixed'                 # time features encoding
+  freq: 'h'                      # freq for time features
+  patch_len: 16                  # patch length
+  stride: 8                      # stride for patching
+  cat_emb_dim: 8                 # embedding dimension per categorical feature
+
+TimesNet:
+  d_model: 64                    # model dimension
+  d_ff: 64                       # feedforward dimension
+  e_layers: 2                    # number of TimesBlock layers
+  dropout: 0.1                   # dropout rate
+  embed: 'fixed'                 # time features encoding
+  freq: 'h'                      # freq for time features
+  top_k: 5                       # top-k frequencies for period detection
+  num_kernels: 6                 # number of inception kernels
+  cat_emb_dim: 8                 # embedding dimension per categorical feature
+
+TimeXer:
+  d_model: 128                   # model dimension
+  n_heads: 8                     # number of attention heads
+  e_layers: 2                    # number of encoder layers
+  d_ff: 256                      # feedforward dimension
+  dropout: 0.1                   # dropout rate
+  activation: 'gelu'             # activation function
+  factor: 1                      # attention factor
+  embed: 'fixed'                 # time features encoding
+  freq: 'h'                      # freq for time features
+  patch_len: 16                  # patch length
+  use_norm: true                 # use instance normalization
+  cat_emb_dim: 8                 # embedding dimension per categorical feature
