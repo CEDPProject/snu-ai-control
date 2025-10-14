@@ -13,8 +13,6 @@ from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import cal_metric
 from utils.utils import Float32Encoder
 
-_logger = logging.getLogger('train')
-
 class AverageMeter:
     def __init__(self):
         self.reset()
@@ -38,6 +36,8 @@ def training_dl(
     early_stopping_metric: str, early_stopping_count: int, lradj: int, 
     learning_rate: int, model_config: dict, scaler_dict: dict = None):
 
+    logger = logging.getLogger('TRAINING') 
+
     # avereage meter
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
@@ -47,18 +47,12 @@ def training_dl(
     model.train()
     start_training_time = time.time()
     end_time = time.time()
-
-    # targets and outputs
-    total_targets = []
-    total_outputs = []
     
     early_stopping = EarlyStopping(patience=early_stopping_count)
         
     # init best score and step
     best_score = np.inf
     wandb_iteration = 0
-    
-    _logger.info(f"\n 🔹 Training started \n")
     
     for epoch in range(epochs):
         epoch_time = time.time()
@@ -103,8 +97,8 @@ def training_dl(
                 wandb.log(train_results, step=idx+1)
         
         if (epoch + 1) % log_epochs == 0:
-            _logger.info("[🚀 TRAINING Status]")
-            _logger.info(
+            logger.info("[🚀 TRAINING Status]")
+            logger.info(
                 'EPOCH {:>3d}/{} | TRAIN [{:>4d}/{}] Loss: {loss.val:>6.4f} ({loss.avg:>6.4f}) '
                 'LR: {lr:.3e} '
                 'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s) '
@@ -162,14 +156,14 @@ def training_dl(
                     # save model
                     torch.save(model.state_dict(), os.path.join(savedir, f'best_model.pt'))
                 
-                _logger.info('Best {0} {1:6.6f} to {2:6.6f}'.format(ckp_metric.upper(), best_score, eval_metrics[ckp_metric]))
-                _logger.info("\n✅ Saved best model")
+                logger.info('Best {0} {1:6.6f} to {2:6.6f}'.format(ckp_metric.upper(), best_score, eval_metrics[ckp_metric]))
+                print("✅ Saved best model")
                 
                 best_score = eval_metrics[ckp_metric]
                 
             early_stopping(eval_metrics[early_stopping_metric])
             if early_stopping.early_stop:
-                _logger.info("⏳ Early stopping triggered")
+                logger.info("⏳ Early stopping triggered")
                 break
             
             adjust_learning_rate(optimizer, epoch + 1, lradj, learning_rate)
@@ -177,13 +171,13 @@ def training_dl(
         end_time = time.time()
             
     # logging best score and step
-    _logger.info('Best Metric: {0:6.6f} (step {1:})\n'.format(state[f'best_{ckp_metric}'], state['best_step']))
+    logger.info('Best Metric: {0:6.6f} (step {1:})'.format(state[f'best_{ckp_metric}'], state['best_step']))
     
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         # save latest model
         torch.save(model.state_dict(), os.path.join(savedir, f'latest_model.pt'))
-        print('Save latest model complete, epoch: {0:}: Best metric has changed from {1:.5f} \
+        logger.info('Save latest model complete, epoch: {0:}: Best metric has changed from {1:.5f} \
             to {2:.5f}'.format(epoch, best_score, eval_metrics[ckp_metric]))
 
         # save latest results
@@ -193,7 +187,7 @@ def training_dl(
         
     # 전체 학습 시간 측정 종료
     total_training_time = time.time() - start_training_time
-    _logger.info("\n🎉 Training complete for all datasets")    
+    logger.info("🎉 Training complete for all datasets")    
     return total_training_time
 
 
@@ -202,7 +196,9 @@ def test_dl(model, dataloader, criterion, accelerator: Accelerator, log_interval
             wandb_config: dict = None, return_output: bool = False, plot_result:bool = False, 
             training_time = None, scaler_dict = None) -> dict:
     
-    _logger.info(f'\n[🔍 Start {name} Evaluation]')
+    logger = logging.getLogger(name) 
+    
+    logger.info(f'[🔍 Start {name} Evaluation]')
     
     # avereage meter
     batch_time_m = AverageMeter()
@@ -248,7 +244,7 @@ def test_dl(model, dataloader, criterion, accelerator: Accelerator, log_interval
             batch_time_m.update(time.time() - end_time)
             
             if (idx+1) % log_interval == 0:
-                _logger.info('{name} [{:>4d}/{}] Loss: {loss.val:>6.4f} ({loss.avg:>6.4f}) '
+                logger.info('{name} [{:>4d}/{}] Loss: {loss.val:>6.4f} ({loss.avg:>6.4f}) '
                             'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s) '
                             'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
                             (idx+1), 
@@ -264,7 +260,6 @@ def test_dl(model, dataloader, criterion, accelerator: Accelerator, log_interval
     
     total_outputs = np.concatenate(total_outputs, axis=0)
     total_targets = np.concatenate(total_targets, axis=0)
-    print(f'{name} shape (normalized):', total_outputs.shape, total_targets.shape)
     
     # Denormalization
     if scaler_dict is not None and 'target_scaler' in scaler_dict:
@@ -283,13 +278,11 @@ def test_dl(model, dataloader, criterion, accelerator: Accelerator, log_interval
             total_targets.reshape(-1, original_shape[-1])
         ).reshape(original_shape)
         
-        print(f'{name} shape (denormalized):', total_outputs_denorm.shape, total_targets_denorm.shape)
-        
         # Use denormalized values for metric calculation
         pred_for_metric = total_outputs_denorm
         true_for_metric = total_targets_denorm
     else:
-        _logger.warning('⚠️  No target_scaler found. Computing metrics on normalized values.')
+        logger.warning('⚠️  No target_scaler found. Computing metrics on normalized values.')
         pred_for_metric = total_outputs
         true_for_metric = total_targets
     
@@ -301,18 +294,18 @@ def test_dl(model, dataloader, criterion, accelerator: Accelerator, log_interval
     results.update([(f'{k}', m) for k, m in metrics.items()])
     
     # logging metrics
-    _logger.info(
-        "\n{}: ".format(name) +
+    logger.info(
+        "{}: ".format(name) +
         " ".join(
             "{}: {:.4f}".format(k.upper(), v) if isinstance(v, (int, float)) and v is not None 
             else "{}: {}".format(k.upper(), v if v is not None else "N/A")
             for k, v in metrics.items()
-        ) + "\n"
+        )
     )
     
     # return results
     results.update([(f'{k}', m) for k, m in metrics.items()])
-    _logger.info('[End {}]\n'.format(name))
+    logger.info('[End {}]'.format(name))
     
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:

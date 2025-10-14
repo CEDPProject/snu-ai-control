@@ -9,7 +9,7 @@ DATASET:
   split_rate: [0.8, 0.1, 0.1]
   split_date: null
   start_date: 2025-08-04 00:00
-  end_date: 2025-08-12 16:43
+  end_date: null
   # end_date: 2023-12-31 23:00:00  
   batch_size: 64
   num_workers: 0
@@ -17,7 +17,7 @@ DATASET:
   pin_memory: true
   drop_last: false
   environment_name: livingroom
-  data_version: version1_250804-250812
+  data_version: version2_250813
   seq_len: 120
   stride_len: 1
   pred_len: 60

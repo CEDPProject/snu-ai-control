@@ -4,12 +4,6 @@ import pandas as pd
 from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder, StandardScaler, MinMaxScaler
 import warnings
 
-import os
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder, StandardScaler, MinMaxScaler
-import warnings
-
 def load_dataset(
                 datadir: str,
                 scaler: str,
@@ -35,7 +29,9 @@ def load_dataset(
     
     # 시간 컬럼 처리
     df_raw['데이터 시간'] = pd.to_datetime(df_raw['데이터 시간'])
-    df_raw = df_raw.sort_values('데이터 시간', ascending=True)
+    
+    # 데이터가 거꾸로 수집되어 있다면 아래 주석 해제
+    # df_raw = df_raw.sort_values('데이터 시간', ascending=True)
     
     # timestamp 별도 저장
     timestamps = df_raw['데이터 시간'].copy()
@@ -44,13 +40,16 @@ def load_dataset(
     if del_feature is not None:
         df_raw = df_raw.drop(columns=del_feature, errors='ignore')
     
-    # 이상치 clipping
-    clip_thresholds = {
+    # 이상치 제거 (row 삭제)
+    outlier_thresholds = {
                     '환기유효전력(W)': 1000,
                     '냉난방유효전력(W)': 1000
                 }
-    if clip_thresholds is not None:
-        df_raw = clip_target_outliers(df_raw, target_features, clip_thresholds)
+    
+    if outlier_thresholds is not None:
+        df_raw = remove_target_outliers(df_raw, target_features, outlier_thresholds)
+        # timestamp도 동일하게 필터링
+        timestamps = df_raw['데이터 시간'].copy()
         
     # 2. 결측치 처리
     df_raw = handle_missing_values(df_raw, ord_categorical_feature, 
@@ -66,7 +65,7 @@ def load_dataset(
     )
     
     # 4. 데이터 분할 (timestamp도 함께 분할)
-    if split_date is not None:
+    if split_date is not None or start_date is not None:
         # 날짜 기준 분할
         data_dict = split_by_date(encoded_df, timestamps, 
                                     split_date, split_rate, start_date, end_date)
@@ -95,25 +94,28 @@ def load_dataset(
     
     return data_dict, feature_names, scaler_dict
 
-def clip_target_outliers(df_raw, target_features, clip_thresholds=None):
+def remove_target_outliers(df_raw, target_features, outlier_thresholds=None):
     """
-    Target feature의 극단적 이상치를 clipping으로 제거
+    Target feature의 극단적 이상치가 있는 row를 완전히 제거
     
     Args:
         df_raw: 원본 DataFrame
         target_features: target feature 이름 리스트
-        clip_thresholds: dict or float
+        outlier_thresholds: dict or float
             - dict: {feature_name: threshold} 형태로 각 feature별 threshold 지정
             - float: 모든 feature에 동일한 threshold 적용
             - None: 자동으로 99.9 percentile 사용
     
     Returns:
-        df_raw: clipping이 적용된 DataFrame
+        df_raw: 이상치 row가 제거된 DataFrame
     """
     
     print("\n" + "=" * 75)
-    print("TARGET FEATURE OUTLIER CLIPPING".center(75))
+    print("TARGET FEATURE OUTLIER REMOVAL".center(75))
     print("=" * 75)
+    
+    original_len = len(df_raw)
+    rows_to_remove = set()  # 제거할 row의 인덱스 저장
     
     for target_feat in target_features:
         if target_feat not in df_raw.columns:
@@ -123,23 +125,22 @@ def clip_target_outliers(df_raw, target_features, clip_thresholds=None):
         # 숫자로 변환 (문자열이 있을 수 있음)
         df_raw[target_feat] = pd.to_numeric(df_raw[target_feat], errors='coerce')
         
-        original_data = df_raw[target_feat].copy()
-        
-        # NaN 제거하고 통계 계산
-        valid_data = original_data.dropna()
+        # NaN이 아닌 유효한 데이터만
+        valid_mask = df_raw[target_feat].notna()
+        valid_data = df_raw.loc[valid_mask, target_feat]
         
         if len(valid_data) == 0:
             warnings.warn(f"Target feature '{target_feat}' has no valid numeric data")
             continue
         
         # Threshold 결정
-        if clip_thresholds is None:
+        if outlier_thresholds is None:
             # 자동: 99.9 percentile 사용
             threshold = np.percentile(valid_data, 99.9)
             print(f"\n[{target_feat}] Auto threshold (p99.9): {threshold:,.0f}")
-        elif isinstance(clip_thresholds, dict):
+        elif isinstance(outlier_thresholds, dict):
             # Dictionary에서 해당 feature의 threshold 가져오기
-            threshold = clip_thresholds.get(target_feat)
+            threshold = outlier_thresholds.get(target_feat)
             if threshold is None:
                 threshold = np.percentile(valid_data, 99.9)
                 print(f"\n[{target_feat}] No threshold specified, using p99.9: {threshold:,.0f}")
@@ -147,30 +148,47 @@ def clip_target_outliers(df_raw, target_features, clip_thresholds=None):
                 print(f"\n[{target_feat}] Manual threshold: {threshold:,.0f}")
         else:
             # 모든 feature에 동일한 threshold
-            threshold = clip_thresholds
+            threshold = outlier_thresholds
             print(f"\n[{target_feat}] Manual threshold: {threshold:,.0f}")
         
         # 통계 출력
-        print(f"  Before clipping:")
+        print(f"  Before removal:")
         print(f"    Min: {valid_data.min():,.0f}")
         print(f"    Max: {valid_data.max():,.0f}")
         print(f"    Mean: {valid_data.mean():,.0f}")
-        print(f"    Valid samples: {len(valid_data):,} / {len(original_data):,}")
+        print(f"    Valid samples: {len(valid_data):,}")
         
-        # Clipping 적용
-        df_raw[target_feat] = df_raw[target_feat].clip(upper=threshold)
+        # Threshold를 초과하는 row 찾기
+        outlier_mask = valid_data > threshold
+        outlier_indices = valid_data[outlier_mask].index
         
-        # 변경된 값 개수
-        clipped_count = (valid_data > threshold).sum()
-        clipped_rate = clipped_count / len(valid_data) * 100 if len(valid_data) > 0 else 0
+        # 제거할 인덱스에 추가
+        rows_to_remove.update(outlier_indices)
         
-        print(f"  After clipping:")
-        print(f"    Max: {df_raw[target_feat].max():,.0f}")
-        print(f"    Clipped: {clipped_count:,} values ({clipped_rate:.2f}%)")
+        outlier_count = len(outlier_indices)
+        outlier_rate = outlier_count / len(valid_data) * 100 if len(valid_data) > 0 else 0
         
-        if clipped_count > 0:
-            outlier_samples = valid_data[valid_data > threshold].values[:5]
-            print(f"    Clipped values (sample): {[f'{v:,.0f}' for v in outlier_samples]}")
+        print(f"  Outliers found:")
+        print(f"    Count: {outlier_count:,} rows ({outlier_rate:.2f}%)")
+        
+        if outlier_count > 0:
+            # 상위 5개 이상치 값 표시
+            outlier_samples = valid_data[outlier_mask].sort_values(ascending=False).head(5).values
+            print(f"    Top outlier values: {[f'{v:,.0f}' for v in outlier_samples]}")
+    
+    # 이상치가 있는 row 제거
+    if rows_to_remove:
+        df_raw = df_raw.drop(index=list(rows_to_remove))
+        df_raw = df_raw.reset_index(drop=True)
+    
+    # 최종 요약
+    removed_count = original_len - len(df_raw)
+    removed_rate = removed_count / original_len * 100 if original_len > 0 else 0
+    
+    print(f"\n[SUMMARY]")
+    print(f"  Original rows: {original_len:,}")
+    print(f"  Removed rows: {removed_count:,} ({removed_rate:.2f}%)")
+    print(f"  Remaining rows: {len(df_raw):,}")
     
     print("=" * 75 + "\n")
     
@@ -556,16 +574,41 @@ def apply_scaling(data_dict, scaler_method, feature_names, target_features):
         
     return data_dict, scaler, target_scaler
 
-def split_by_date(encoded_df, timestamps, split_date, split_rate=[0.8, 0.1, 0.1],
+def split_by_date(encoded_df, timestamps, split_date=None, split_rate=[0.8, 0.1, 0.1],
                   start_date=None, end_date=None):
     """
-    시계열 데이터를 2단계로 train/val/test 분할 (timestamp 포함)
+    시계열 데이터를 train/val/test 분할 (timestamp 포함)
+    
+    Args:
+        encoded_df: 인코딩된 데이터프레임
+        timestamps: 타임스탬프 Series/Array
+        split_date: 날짜 분할 기준. None이면 split_rate로만 분할
+        split_rate: [train, val, test] 비율 (default: [0.8, 0.1, 0.1])
+        start_date: 시작 날짜 (optional)
+        end_date: 종료 날짜 (optional)
+    
+    Returns:
+        data_dict: {'train': {'data': ..., 'timestamps': ...}, 'val': ..., 'test': ...}
     """
     
     # 1. 날짜 범위 설정
     start_dt, end_dt = _get_date_range(timestamps, start_date, end_date)
     
-    # 2. split_rate 분리
+    # 날짜 범위로 데이터 필터링
+    valid_mask = (timestamps >= start_dt) & (timestamps <= end_dt)
+    
+    if isinstance(encoded_df, pd.DataFrame):
+        filtered_df = encoded_df[valid_mask]
+        filtered_timestamps = timestamps[valid_mask]
+    else:
+        filtered_df = encoded_df[valid_mask.values] if hasattr(valid_mask, 'values') else encoded_df[valid_mask]
+        filtered_timestamps = timestamps[valid_mask.values] if hasattr(valid_mask, 'values') else timestamps[valid_mask]
+    
+    # split_date가 없으면 split_rate로만 분할
+    if split_date is None:
+        return _split_by_ratio_only(filtered_df, filtered_timestamps, split_rate, start_dt, end_dt)
+    
+    # 2. split_rate 분리 (date 기반 분할용)
     train_ratio, val_ratio = split_rate[0], split_rate[1]
     
     # 3. split_date로 train+val과 test 분할점 계산
@@ -573,7 +616,7 @@ def split_by_date(encoded_df, timestamps, split_date, split_rate=[0.8, 0.1, 0.1]
     
     # 4. 1단계 분할: (train+val) vs test
     trainval_data, trainval_timestamps, test_data, test_timestamps = _split_trainval_test(
-        encoded_df, timestamps, start_dt, trainval_end, end_dt
+        filtered_df, filtered_timestamps, start_dt, trainval_end, end_dt
     )
     
     # 5. 2단계 분할: train vs val
@@ -596,6 +639,96 @@ def split_by_date(encoded_df, timestamps, split_date, split_rate=[0.8, 0.1, 0.1]
     
     return data_dict
 
+
+def _split_by_ratio_only(encoded_df, timestamps, split_rate, start_dt, end_dt):
+    """
+    split_rate만으로 train/val/test 분할 (날짜 기준 없이)
+    
+    Args:
+        encoded_df: 필터링된 데이터프레임
+        timestamps: 필터링된 타임스탬프
+        split_rate: [train_ratio, val_ratio, test_ratio]
+        start_dt, end_dt: 날짜 범위 (출력용)
+    """
+    train_ratio, val_ratio, test_ratio = split_rate
+    
+    n_samples = len(encoded_df)
+    
+    # 분할 인덱스 계산
+    train_size = int(n_samples * train_ratio)
+    val_size = int(n_samples * val_ratio)
+    
+    # 데이터 분할
+    if isinstance(encoded_df, pd.DataFrame):
+        train_data = encoded_df.iloc[:train_size].values
+        val_data = encoded_df.iloc[train_size:train_size+val_size].values
+        test_data = encoded_df.iloc[train_size+val_size:].values
+    else:
+        train_data = encoded_df[:train_size]
+        val_data = encoded_df[train_size:train_size+val_size]
+        test_data = encoded_df[train_size+val_size:]
+    
+    # 타임스탬프 분할
+    if isinstance(timestamps, pd.Series):
+        train_timestamps = timestamps.iloc[:train_size].values
+        val_timestamps = timestamps.iloc[train_size:train_size+val_size].values
+        test_timestamps = timestamps.iloc[train_size+val_size:].values
+    else:
+        train_timestamps = timestamps[:train_size]
+        val_timestamps = timestamps[train_size:train_size+val_size]
+        test_timestamps = timestamps[train_size+val_size:]
+    
+    # 결과 딕셔너리
+    data_dict = {
+        'train': {'data': train_data, 'timestamps': train_timestamps},
+        'val': {'data': val_data, 'timestamps': val_timestamps},
+        'test': {'data': test_data, 'timestamps': test_timestamps}
+    }
+    
+    # 정보 출력
+    _print_ratio_split_summary(data_dict, split_rate, start_dt, end_dt)
+    
+    return data_dict
+
+def _print_ratio_split_summary(data_dict, split_rate, start_dt, end_dt):
+    """비율 기반 분할 정보 출력"""
+    print("\n" + "=" * 75)
+    print("RATIO-BASED DATA SPLIT SUMMARY".center(75))
+    print("=" * 75)
+    
+    print(f"\nDate Range: {start_dt:%Y-%m-%d %H:%M} ~ {end_dt:%Y-%m-%d %H:%M}")
+    print(f"Split Ratio: Train={split_rate[0]:.1%}, Val={split_rate[1]:.1%}, Test={split_rate[2]:.1%}")
+    
+    print("\n" + "-" * 75)
+    total = sum(len(v['data']) for v in data_dict.values())
+    
+    for idx, name in enumerate(['train', 'val', 'test']):
+        count = len(data_dict[name]['data'])
+        ratio = count / total if total > 0 else 0
+        expected = split_rate[idx]
+        
+        timestamps = data_dict[name]['timestamps']
+        if len(timestamps) > 0:
+            start = pd.to_datetime(timestamps[0])
+            end = pd.to_datetime(timestamps[-1])
+            print(f"  {name.capitalize():5s}: {count:,} samples ({ratio:6.2%}, expected {expected:.1%})")
+            print(f"         Time: {start:%Y-%m-%d %H:%M} ~ {end:%Y-%m-%d %H:%M}")
+        else:
+            print(f"  {name.capitalize():5s}: {count:,} samples ({ratio:6.2%}, expected {expected:.1%})")
+    
+    # 경고
+    warnings_list = []
+    for name in ['train', 'val', 'test']:
+        if len(data_dict[name]['data']) == 0:
+            warnings_list.append(f"⚠️  {name.upper()} set is EMPTY!")
+    
+    if warnings_list:
+        print("\n" + "-" * 75)
+        print("WARNINGS:")
+        for warning in warnings_list:
+            print(f"  {warning}")
+    
+    print("=" * 75 + "\n")
 
 def _get_date_range(timestamps, start_date, end_date):
     """날짜 범위 설정"""

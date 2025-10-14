@@ -13,7 +13,7 @@ from data_provider import create_dataloader
 from losses import create_criterion
 from optimizers import create_optimizer
 from models import create_model
-from utils.log import setup_default_logging
+from utils.log import setup_main_logging
 from utils.utils import version_build, load_resume_model, Float32Encoder
 from utils.tools import update_information
 from arguments import parser
@@ -22,13 +22,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 
-_logger = get_logger('train')
-
-def main(cfg):
-
-    # set logger
-    setup_default_logging()
-    
+def main(cfg):    
     # set seed
     set_seed(cfg.DEFAULT.seed)
     
@@ -49,9 +43,15 @@ def main(cfg):
                                     logdir = savedir, 
                                     resume = cfg.TRAIN.resume)
     
-    # set device
-    if accelerator.is_local_main_process:
-        _logger.info('Device: {}'.format(accelerator.device))
+    # logging
+    logger = setup_main_logging(
+        accelerator, 
+        savedir, 
+        debug=cfg.get('DEBUG', False)
+    )
+    
+    # device
+    logger.info('Device: {}'.format(accelerator.device))
     
     # load and define dataloader
     trn_dataloader, val_dataloader, tst_dataloader, metadata, scaler_dict = create_dataloader(
@@ -116,11 +116,13 @@ def main(cfg):
         params       = cfg.MODELSETTING
         )
     
+    logger.info('Model name: {}'.format(cfg.MODEL.modelname))
+    
     # load weights
     if cfg.TRAIN.resume:
         load_resume_model(model=model, savedir=savedir, resume_num=cfg.TRAIN.resume_number)
 
-    _logger.info('# of learnable params: {}'.format(np.sum([p.numel() if p.requires_grad else 0 for p in model.parameters()])))
+    logger.info('# of learnable params: {}'.format(np.sum([p.numel() if p.requires_grad else 0 for p in model.parameters()])))
     
     # set training
     criterion = create_criterion(loss_name=cfg.LOSS.loss_name)
@@ -181,7 +183,7 @@ def main(cfg):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         test_metrics = {str(key): value for key, value in test_metrics.items()}
-        _logger.info('test_metrics: {}'.format(test_metrics))
+        logger.info('test_metrics: {}'.format(test_metrics))
         json.dump(test_metrics, open(os.path.join(savedir, 'test_results.json'),'w'), indent='\t', cls=Float32Encoder)
 
         if cfg.TRAIN.del_pt_file:
@@ -190,9 +192,9 @@ def main(cfg):
                 try:
                     os.remove(pt_file)
                 except Exception as e:
-                    _logger.warning(f"Failed to delete {pt_file}: {e}")
+                    logger.warning(f"Failed to delete {pt_file}: {e}")
     
-    print('\n🎉 Done 🎉 \n')
+    print('🎉 Done 🎉 \n')
     
 if __name__=='__main__':
     cfg = parser()

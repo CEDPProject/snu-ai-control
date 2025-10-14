@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0
 
 # 모델 리스트
 models=("DLinear" "iTransformer" "MICN" "PatchTST" "TimesNet" "TimeXer")
@@ -25,7 +25,7 @@ for model in "${models[@]}"; do
                 --model_cfg ./configs/model_setting.yaml \
                 --opts DATASET.environment_name="$env" \
                         DATASET.target_features="['$target']" \
-                        DATASET.start_date: 2025-08-04 00:00 \
+                        DATASET.start_date="2025-08-04 00:00" \
             
             # 각 실행 후 구분선
             echo ""
@@ -60,7 +60,7 @@ for model in "${models[@]}"; do
                 --model_cfg ./configs/model_setting.yaml \
                 --opts DATASET.environment_name="$env" \
                         DATASET.target_features="['$target']" \
-                        DATASET.start_date: 2025-08-05 10:59 \
+                        DATASET.start_date="2025-08-05 10:59" \
             
             # 각 실행 후 구분선
             echo ""
