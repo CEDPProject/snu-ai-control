@@ -1,9 +1,10 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # 모델 리스트
-models=("DLinear" "iTransformer" "MICN" "PatchTST" "TimesNet" "TimeXer")
+# models=("DLinear" "iTransformer" "MICN" "PatchTST" "TimesNet" "TimeXer" "FreTS" "Koopa" "TimeMixer" "TSMixer")
+models=("TimesNet")
 
 # 환경 리스트
 environments=("livingroom" "room1" "room2")
@@ -35,10 +36,9 @@ for model in "${models[@]}"; do
     done
 done
 
-
-
 # 모델 리스트
-models=("DLinear" "iTransformer" "MICN" "PatchTST" "TimesNet" "TimeXer")
+# models=("DLinear" "iTransformer" "MICN" "PatchTST" "TimesNet" "TimeXer" "FreTS" "Koopa" "TimeMixer" "TSMixer")
+models=("TimesNet")
 
 # 환경 리스트
 environments=("livingroom" "room1" "room2")

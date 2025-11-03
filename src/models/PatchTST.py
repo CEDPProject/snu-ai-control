@@ -36,7 +36,7 @@ class Model(nn.Module):
 
     def __init__(self, configs, patch_len=16, stride=8):
         super().__init__()
-        self.task_name = configs.get('task_name', 'long_term_forecast')
+        
         self.seq_len = configs['METADATA']['seq_len']
         self.pred_len = configs['METADATA']['pred_len']
         padding = stride

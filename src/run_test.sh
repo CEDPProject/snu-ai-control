@@ -3,7 +3,9 @@
 export CUDA_VISIBLE_DEVICES=1
 
 # 모델 리스트
-models=("DLinear" "iTransformer" "MICN" "PatchTST" "TimesNet" "TimeXer")
+# models=("DLinear" "iTransformer" "MICN" "PatchTST" "TimesNet" "TimeXer")
+# 모델 리스트
+models=("TimeMixer")
 
 # 환경 리스트
 environments=("livingroom")

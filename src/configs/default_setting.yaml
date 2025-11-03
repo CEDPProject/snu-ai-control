@@ -1,5 +1,5 @@
 DEFAULT:
-  exp_name: KETI_system_control
+  exp_name: system_control
   seed: 42
   del_pt: False
 
@@ -17,7 +17,7 @@ DATASET:
   pin_memory: true
   drop_last: false
   environment_name: livingroom
-  data_version: version2_250813
+  data_version: version2_250813_processed
   seq_len: 120
   stride_len: 1
   pred_len: 60
@@ -45,7 +45,7 @@ MPC:
 
 
 TRAIN:
-  epoch: 30
+  epoch: 20
   ckp_metric: loss
   eval_epochs: 1
   log_epochs: 1
@@ -66,7 +66,7 @@ TRAIN:
     use: false
     wandb_iter: 500
     exp_name: default
-    project_name: 'KETI_weather_prediction'
+    project_name: 'system_control'
     entity: null
 LOSS:
   loss_name: mse

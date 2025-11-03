@@ -77,3 +77,75 @@ TimeXer:
   patch_len: 16                  # patch length
   use_norm: true                 # use instance normalization
   cat_emb_dim: 8                 # embedding dimension per categorical feature
+
+FreTS:
+  # Model architecture
+  embed_size: 128                 # embedding dimension for token
+  hidden_size: 256                # hidden size for prediction head
+  
+  # Frequency-domain parameters
+  channel_independence: '1'       # '0': channel mixing enabled, '1': disabled
+  sparsity_threshold: 0.01        # threshold for soft-shrinkage in frequency domain
+  scale: 0.02                     # initialization scale for frequency-domain weights
+  
+  # Categorical embedding
+  cat_emb_dim: 8                  # embedding dimension per categorical feature
+
+Koopa:
+  # Koopman predictor parameters
+  seg_len: null                   # segment length (null means using pred_len)
+  dynamic_dim: 128                # latent dimension of koopman embedding
+  hidden_dim: 64                  # hidden dimension of MLP encoder/decoder
+  hidden_layers: 2                # number of hidden layers in MLP
+  num_blocks: 3                   # number of Koopa blocks
+  multistep: false                # whether to use approximation for multistep K
+  alpha: 0.2                      # spectrum filter ratio for Fourier filter
+  
+  # Categorical embedding
+  cat_emb_dim: 8                  # embedding dimension per categorical feature
+
+TimeMixer:
+  # Model dimensions
+  d_model: 64                    # model dimension
+  d_ff: 128                       # feedforward dimension
+  e_layers: 2                     # number of encoder layers
+  dropout: 0.1                    # dropout rate
+  
+  # Embedding parameters
+  embed: 'timeF'                  # time features encoding: 'timeF', 'fixed', 'learned'
+  freq: 'h'                       # freq for time features: 's','t','h','d','b','w','m'
+  
+  # Multi-scale parameters
+  down_sampling_window: 2         # down-sampling window size
+  down_sampling_layers: 3         # number of down-sampling layers
+  down_sampling_method: 'avg'     # down-sampling method: 'avg', 'max', 'conv'
+  
+  # Decomposition parameters
+  decomp_method: 'moving_avg'     # decomposition method: 'moving_avg', 'dft_decomp'
+  moving_avg: 25                  # moving average window size (for moving_avg method)
+  top_k: 5                        # top-k frequencies (for dft_decomp method)
+  
+  # Channel parameters
+  channel_independence: true      # whether to process channels independently
+  
+  # Normalization
+  use_norm: 1                     # 0: no normalization, 1: use normalization
+  
+  # Categorical embedding
+  cat_emb_dim: 8                  # embedding dimension per categorical feature
+  
+  # Label length (for some tasks)
+  label_len: 48                   # length of start token
+
+TSMixer:
+  # Model architecture parameters
+  output_channels: null          # null이면 input channels와 동일 (자동 설정)
+  activation_fn: 'relu'          # activation function: 'relu', 'gelu', 'tanh'
+  num_blocks: 2                  # number of mixer blocks
+  dropout: 0.1                   # dropout rate
+  ff_dim: 64                     # feedforward dimension in mixer layer
+  normalize_before: true         # apply normalization before or after mixer
+  norm_type: 'batch'             # normalization type: 'batch' or 'layer'
+  
+  # Categorical embedding
+  cat_emb_dim: 8                 # embedding dimension per categorical feature
