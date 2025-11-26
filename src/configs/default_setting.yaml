@@ -54,7 +54,7 @@ TRAIN:
   early_stopping_metric: mse
   lradj: type1
   resume: null
-  return_output: false
+  return_output: true
   plot_result: false
   del_pt_file: true
   data_num: 0
