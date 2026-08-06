@@ -49,9 +49,10 @@ class HVACDataset(Dataset):
                         missing.append(it)
             if missing:
                 raise ValueError(f"{label}에서 못 찾은 열: {missing}")
-            return sorted(set(idxs))
+            return list(dict.fromkeys(idxs))
 
         self.target_idx = to_indices_exact(target_features, "타깃 feature")
+        self.target_names = [self.features[i] for i in self.target_idx]
         
         # input features: 기본은 전체
         if input_features is None:
@@ -75,6 +76,8 @@ class HVACDataset(Dataset):
             numerical_names = [n for n in input_feature_names if n not in cat_names]
 
         # 3) 이름 -> 인덱스
+        self.input_cat_names = cat_names
+        self.input_num_names = numerical_names
         self.input_cat_idx = [name_to_idx[n] for n in cat_names]
         self.input_num_idx = [name_to_idx[n] for n in numerical_names]
         
@@ -82,6 +85,9 @@ class HVACDataset(Dataset):
         overlap = set(self.input_cat_idx) & set(self.input_num_idx)
         if overlap:
             self.input_num_idx = [i for i in self.input_num_idx if i not in overlap]
+
+        self.input_cat_names = [self.features[i] for i in self.input_cat_idx]
+        self.input_num_names = [self.features[i] for i in self.input_num_idx]
         
         # 한 샘플 길이/개수
         self.total_len = self.seq_len + self.pred_len
@@ -133,6 +139,9 @@ class HVACDataset(Dataset):
             "input_cat_idx": self.input_cat_idx,
             "input_num_idx": self.input_num_idx,
             "target_idx": self.target_idx,
+            "input_categorical_features": self.input_cat_names,
+            "input_numerical_features": self.input_num_names,
+            "target_features": self.target_names,
             "seq_len": self.seq_len,
             "pred_len": self.pred_len,
             "stride_len": self.stride_len,

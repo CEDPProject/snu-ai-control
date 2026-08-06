@@ -132,3 +132,7 @@ src/logs/
 src/checkpoints/
 src/results/
 src/saved_model/
+
+# saved model artifacts at repo root
+/saved_model/
+/saved_model_pre_robust_20260715_0040/

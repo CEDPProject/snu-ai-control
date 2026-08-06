@@ -1,59 +1,77 @@
+from collections.abc import Mapping
+
 import numpy as np
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 
 class EarlyStopping:
-    def __init__(self, patience=5, delta=0):
+    """Stop after a meaningful validation improvement has not occurred."""
+
+    def __init__(self, patience=8, min_delta=1e-4):
+        if patience < 1:
+            raise ValueError('patience must be at least 1')
+        if min_delta < 0:
+            raise ValueError('min_delta must be non-negative')
         self.patience = patience
+        self.min_delta = min_delta
         self.counter = 0
-        self.best_score = None
+        self.best_value = np.inf
         self.early_stop = False
-        self.val_loss_min = np.Inf
-        self.delta = delta
-    def __call__(self, val_loss):
-        score = -val_loss
-        if self.best_score is None:
-            self.best_score = score
-            self.val_loss_min = val_loss
-        elif score < self.best_score + self.delta:
-            self.counter += 1
-            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            self.val_loss_min = val_loss
+
+    def __call__(self, value):
+        value = float(value)
+        improved = value < self.best_value - self.min_delta
+        if improved:
+            self.best_value = value
             self.counter = 0
+        else:
+            self.counter += 1
+            self.early_stop = self.counter >= self.patience
+        return improved
+
 
 def update_information(model_name, cfg, information_dict):
-    """
-    cfg 딕셔너리에 metadata를 METADATA 섹션으로 추가
-    """
-    # MODEL 섹션 업데이트
+    """Add model and data metadata to the resolved experiment config."""
     cfg['MODEL']['modelname'] = model_name
-    
-    # METADATA 섹션에 전체 metadata 저장
     cfg['MODELSETTING']['METADATA'] = information_dict
-    
     return cfg
 
-def adjust_learning_rate(optimizer, epoch, lradj, learning_rate):
-    # lr = learning_rate * (0.2 ** (epoch // 2))
-    if lradj == 'type1':
-        lr_adjust = {epoch: learning_rate * (0.5 ** ((epoch - 1) // 1))}
-    elif lradj == 'type2':
-        lr_adjust = {
-            2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6,
-            10: 5e-7, 15: 1e-7, 20: 5e-8
-        }
-    elif lradj == 'type3':
-        lr_adjust = {epoch: learning_rate if epoch < 10 else learning_rate*0.1}
-    elif lradj == 'type4':
-        lr_adjust = {epoch: learning_rate if epoch < 15 else learning_rate*0.1}
-    elif lradj == 'type5':
-        lr_adjust = {epoch: learning_rate if epoch < 25 else learning_rate*0.1}
-    elif lradj == 'type6':
-        lr_adjust = {epoch: learning_rate if epoch < 5 else learning_rate*0.1}  
-    if epoch in lr_adjust.keys():
-        lr = lr_adjust[epoch]
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        print('Updating learning rate to {}\n'.format(lr))
+
+def create_lr_scheduler(optimizer, scheduler_type, scheduler_config):
+    """Create a validation-driven scheduler with an explicit lower LR bound."""
+    normalized_type = str(scheduler_type).lower()
+    if normalized_type in {'none', 'constant'}:
+        return None
+    if normalized_type not in {'reduce_on_plateau', 'plateau'}:
+        raise ValueError(
+            f'Unknown lr scheduler {scheduler_type!r}; '
+            'use reduce_on_plateau or constant'
+        )
+
+    if scheduler_config is None:
+        config = {}
+    elif isinstance(scheduler_config, Mapping):
+        config = dict(scheduler_config)
+    else:
+        raise TypeError('scheduler_config must be a mapping')
+
+    factor = float(config.get('factor', 0.5))
+    patience = int(config.get('patience', 2))
+    min_lr = float(config.get('min_lr', 1e-6))
+    if not 0.0 < factor < 1.0:
+        raise ValueError('lr_scheduler.factor must be in (0, 1)')
+    if patience < 0:
+        raise ValueError('lr_scheduler.patience must be non-negative')
+    if min_lr < 0:
+        raise ValueError('lr_scheduler.min_lr must be non-negative')
+
+    return ReduceLROnPlateau(
+        optimizer,
+        mode=str(config.get('mode', 'min')),
+        factor=factor,
+        patience=patience,
+        threshold=float(config.get('threshold', 1e-3)),
+        threshold_mode=str(config.get('threshold_mode', 'rel')),
+        cooldown=int(config.get('cooldown', 0)),
+        min_lr=min_lr,
+    )

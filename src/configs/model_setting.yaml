@@ -1,15 +1,3 @@
-MPCController:
-  prediction_horizon: 60
-  control_horizon: 10
-  co2_limit: 2.0
-  pm10_limit: 2.0
-  temp_min: -1.5
-  temp_max: 1.5
-  power_weight: 1.0
-  comfort_weight: 0.5
-  control_change_weight: 0.1
-  observable_states: all
-
 DLinear:
   individual: false              # true: per-variate linear layers, false: shared layers
   moving_avg: 25                 # kernel size for seasonal-trend decomposition

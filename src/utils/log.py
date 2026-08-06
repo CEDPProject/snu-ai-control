@@ -1,6 +1,7 @@
 import logging
 import logging.handlers
 import os
+import sys
 
 class ColoredFormatter(logging.Formatter):
     """컬러와 레벨별 포맷을 지원하는 포매터"""
@@ -39,7 +40,10 @@ def setup_default_logging(default_level=logging.INFO, log_path='', silent=False)
     
     # 콘솔 핸들러 (silent가 False일 때만 추가)
     if not silent:
-        console_handler = logging.StreamHandler()
+        # Keep logs and unavoidable third-party prints on the same stream.
+        # Mixing stderr logging with buffered stdout made preprocessing
+        # messages appear after training had already finished.
+        console_handler = logging.StreamHandler(stream=sys.stdout)
         console_handler.setFormatter(ColoredFormatter())
         logging.root.addHandler(console_handler)
     
@@ -53,7 +57,8 @@ def setup_default_logging(default_level=logging.INFO, log_path='', silent=False)
         file_handler = logging.handlers.RotatingFileHandler(
             log_path, 
             maxBytes=(1024 ** 2 * 2), 
-            backupCount=3
+            backupCount=3,
+            encoding='utf-8',
         )
         file_formatter = logging.Formatter(
             "%(asctime)s - %(name)20s: [%(levelname)8s] - %(message)s",
@@ -81,28 +86,31 @@ class TrainingLogger:
             if isinstance(handler, (logging.FileHandler, logging.handlers.RotatingFileHandler)):
                 self.file_logger.addHandler(handler)
     
-    def info(self, message):
-        """메인 프로세스에서만 INFO 로깅"""
+    def info(self, message, *args, **kwargs):
+        """Log INFO on the main process using the standard Logger contract."""
         if self.accelerator.is_main_process:
-            self.logger.info(message)
-    
-    def info_file_only(self, message):
-        """파일에만 INFO 로깅"""
+            self.logger.info(message, *args, **kwargs)
+
+    def info_file_only(self, message, *args, **kwargs):
+        """Log INFO only to the run file on the main process."""
         if self.accelerator.is_main_process:
-            self.file_logger.info(message)
-    
-    def warning(self, message):
-        """모든 프로세스에서 WARNING 로깅"""
-        self.logger.warning(f"[Process {self.accelerator.process_index}] {message}")
-    
-    def error(self, message, exc_info=False):
-        """모든 프로세스에서 ERROR 로깅"""
-        self.logger.error(f"[Process {self.accelerator.process_index}] {message}", exc_info=exc_info)
-    
-    def debug(self, message):
-        """디버깅용 - 환경변수로 활성화 가능"""
+            self.file_logger.info(message, *args, **kwargs)
+
+    def warning(self, message, *args, **kwargs):
+        """Log WARNING with process context."""
+        prefix = f"[Process {self.accelerator.process_index}] "
+        self.logger.warning(prefix + str(message), *args, **kwargs)
+
+    def error(self, message, *args, **kwargs):
+        """Log ERROR with process context."""
+        prefix = f"[Process {self.accelerator.process_index}] "
+        self.logger.error(prefix + str(message), *args, **kwargs)
+
+    def debug(self, message, *args, **kwargs):
+        """Log DEBUG when DEBUG_MODE is enabled."""
         if os.environ.get('DEBUG_MODE', 'false').lower() == 'true':
-            self.logger.debug(f"[Process {self.accelerator.process_index}] {message}")
+            prefix = f"[Process {self.accelerator.process_index}] "
+            self.logger.debug(prefix + str(message), *args, **kwargs)
 
 def setup_main_logging(accelerator, savedir, debug=False, silent=False):
     """학습용 로깅 설정 - setup_default_logging 활용

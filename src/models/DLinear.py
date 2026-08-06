@@ -1,3 +1,5 @@
+from models.common import target_channel_indices
+
 import torch
 import torch.nn as nn
 
@@ -23,6 +25,7 @@ class Model(nn.Module):
         
         # Categorical embedding
         self.cat_emb_dim = configs.get('cat_emb_dim', 8)  # embedding dimension per categorical feature
+        self.target_channel_indices = target_channel_indices(configs, self.cat_emb_dim)
         
         if self.n_cat > 0:
             # Each categorical feature gets projected to embedding dimension
@@ -69,9 +72,13 @@ class Model(nn.Module):
                                           dtype=seasonal_init.dtype).to(seasonal_init.device)
             trend_output = torch.zeros([trend_init.size(0), self.n_target, self.pred_len],
                                        dtype=trend_init.dtype).to(trend_init.device)
-            for i in range(self.n_target):
-                seasonal_output[:, i, :] = self.Linear_Seasonal[i](seasonal_init[:, i, :])
-                trend_output[:, i, :] = self.Linear_Trend[i](trend_init[:, i, :])
+            for output_index, input_index in enumerate(self.target_channel_indices):
+                seasonal_output[:, output_index, :] = self.Linear_Seasonal[output_index](
+                    seasonal_init[:, input_index, :]
+                )
+                trend_output[:, output_index, :] = self.Linear_Trend[output_index](
+                    trend_init[:, input_index, :]
+                )
         else:
             # Project to target dimension first
             seasonal_init = self.input_projection(seasonal_init.permute(0, 2, 1)).permute(0, 2, 1)  # (batch, n_target, seq_len)

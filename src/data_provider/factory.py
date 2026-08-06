@@ -120,30 +120,30 @@ def create_dataloader(
                                 pin_memory     =  pin_memory,
                                 drop_last      =  False)
     
-    # 메타데이터 구성
+    # Metadata describes the tensors actually emitted by HVACDataset.
     metadata = {
-        'features': features,
-        'seq_len': seq_len,
-        'pred_len': pred_len,
-        'n_features': len(features),
-        'feature_types': {
-            'ordinal': ord_categorical_feature,
-            'categorical': categorical_feature,
-            'numerical': numerical_feature,
-            'n_num': len(numerical_feature),
-            'n_cat': len(all_categorical_feature),
-            'n_target': len(target_features),
+        "features": features,
+        "seq_len": seq_len,
+        "pred_len": pred_len,
+        "n_features": len(features),
+        "input_categorical_features": trn_dataset.input_cat_names,
+        "input_numerical_features": trn_dataset.input_num_names,
+        "target_features": trn_dataset.target_names,
+        "feature_types": {
+            "ordinal": ord_categorical_feature,
+            "categorical": categorical_feature,
+            "numerical": numerical_feature,
+            "n_num": len(trn_dataset.input_num_names),
+            "n_cat": len(trn_dataset.input_cat_names),
+            "n_target": len(trn_dataset.target_names),
         },
-        'batch_size': batch_size,
-        'model_name': model_name,
-        'environment_name': environment_name,
-        'data_version': data_version
+        "batch_size": batch_size,
+        "model_name": model_name,
+        "environment_name": environment_name,
+        "data_version": data_version,
     }
-    
-    if 'MPC' in model_name:
-        return trn_dataloader, val_dataloader, tst_dataloader, metadata, scaler_dict
-    else:
-        return trn_dataloader, val_dataloader, tst_dataloader, metadata, scaler_dict
+
+    return trn_dataloader, val_dataloader, tst_dataloader, metadata, scaler_dict
 
 def custom_collate_fn(batch):
     """

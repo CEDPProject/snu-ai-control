@@ -17,7 +17,7 @@ DATASET:
   pin_memory: true
   drop_last: false
   environment_name: livingroom
-  data_version: version2_250813_processed
+  data_version: version3_260714_processed
   seq_len: 120
   stride_len: 1
   pred_len: 60
@@ -37,11 +37,423 @@ DATASET:
   ignore_feature: null
 
 MPC:
-  use_mpc: false
-  prediction_horizon: 24  
-  control_horizon: 12     
-  dt: 0.25               
-  mpc_iter: 50
+  sample_interval_minutes: 1
+  prediction_horizon: 60
+  control_horizon: 10
+
+  # Runtime에서는 미래 외란의 마지막 관측값을 유지한다. 오프라인 상한선
+  # 실험이 필요할 때만 "perfect"로 바꿔 실제 미래 외란을 사용한다.
+  disturbance_forecast: persistence
+  disturbance_variables:
+    - 실외미세먼지(㎍/㎥)
+    - 실외초미세먼지(㎍/㎥)
+    - 실외온도(℃)
+    - 실외습도(%)
+  power_variables:
+    - 환기유효전력(W)
+    - 냉난방유효전력(W)
+
+  # 모든 제어변수는 최적화 대상이다. default는 결측/초기 제어 표현에만 쓴다.
+  control_variables:
+    - name: 환기전원
+      categories: ['OFF', 'ON']
+      default: 'OFF'
+    - name: 환기풍량
+      categories: [0, 2, 4, 6]
+      default: 0
+    - name: 환기운전모드
+      categories: [꺼짐, 공기청정, 바이패스, 환기]
+      default: 꺼짐
+    - name: 냉난방전원
+      categories: ['OFF', 'ON']
+      default: 'OFF'
+    - name: 냉난방풍량
+      categories: [약풍, 중풍, 강풍]
+      default: 약풍
+    - name: 냉난방운전모드
+      categories: [냉방, 난방]
+      default: 냉방
+    - name: 냉난방설정온도(℃)
+      categories: [18, 22, 26]
+      default: 22
+
+  # 장비 전원이 꺼진 경우 하위 설정을 한 대표값에 고정해 중복 조합을 제거한다.
+  logical_rules:
+    - when: {variable: 환기전원, value: 'OFF'}
+      require:
+        환기풍량: 0
+        환기운전모드: 꺼짐
+    - when: {variable: 환기전원, value: 'ON'}
+      forbid:
+        환기풍량: [0]
+        환기운전모드: [꺼짐]
+    - when: {variable: 냉난방전원, value: 'OFF'}
+      require:
+        냉난방풍량: 약풍
+        냉난방운전모드: 냉방
+        냉난방설정온도(℃): 22
+
+  # 실험용 초기 기준이다. hard constraint 대신 slack + penalty로 항상 해를 허용한다.
+  state_constraints:
+    - {name: 실내미세먼지(㎍/㎥), lower: null, upper: 50.0, penalty: 20.0}
+    - {name: 실내초미세먼지(㎍/㎥), lower: null, upper: 35.0, penalty: 30.0}
+    - {name: 실내이산화탄소(ppm), lower: null, upper: 1000.0, penalty: 1.0}
+    - {name: 실내휘발성유기화합물(ppb), lower: null, upper: 400.0, penalty: 2.0}
+    - {name: 실내온도(℃), lower: 20.0, upper: 26.0, penalty: 100.0}
+    - {name: 실내습도(%), lower: 30.0, upper: 70.0, penalty: 20.0}
+
+  affine_models:
+    state_ridge_alpha: 1.0
+    power_ridge_alpha: 1.0
+    # MAPE는 분모가 0에 가까운 OFF 구간을 제외한다. 결과에 유효 표본 수와
+    # coverage가 함께 저장되므로 이 값을 바꾸면 반드시 함께 보고한다.
+    mape_min_actual_power_w: 0.1
+    minimum_test_power_r2: 0.7
+    maximum_rollout_power_wape_percent: 20.0
+    maximum_constraint_false_safe_rate_percent: 5.0
+    fail_on_low_quality: false
+
+  # MPC 최적화에 쓰는 affine 모델과 분리된 offline 평가용 plant surrogate다.
+  # 기본값은 기존 ExtraTrees이며 model_family를 바꿀 때만 다른 모델을 학습한다.
+  independent_evaluator:
+    model_family: extra_trees_residual_state
+    # 추가 후보는 train-only 학습 후 동일 validation protocol로만 비교한다.
+    # 예: [random_forest_residual_state, neural_residual, 'forecasting:DLinear']
+    validation_model_families: []
+    # 후보가 있을 때 train-only 모델을 validation window에서 비교한다.
+    # 0은 validation split의 가능한 window 전체다.
+    validation_max_windows: 0
+
+    # sklearn evaluator 공통 설정. max_iter는 HistGradientBoosting에서 사용한다.
+    n_estimators: 100
+    min_samples_leaf: 5
+    max_features: 1.0
+    max_iter: 100
+    # recursive step에서 작은 batch를 반복하므로 thread overhead를 피한다.
+    n_jobs: 1
+
+    # 독립 Ridge baseline의 상태·전력 오차를 MLP가 보정한다. MPC의 affine
+    # 계수를 재사용하지 않으므로 최적화 모델과 평가 모델의 분리를 유지한다.
+    neural_residual:
+      ridge_alpha: 1.0
+      stabilize_linear_dynamics: true
+      maximum_spectral_radius: 0.999
+      hidden_sizes: [128, 128]
+      activation: gelu
+      dropout: 0.1
+      epochs: 30
+      batch_size: 256
+      learning_rate: 0.001
+      weight_decay: 0.0001
+      patience: 5
+      min_delta: 0.00001
+      validation_fraction: 0.1
+      device: auto
+
+    # forecasting_sequence 또는 forecasting:<model> 선택 시 사용한다.
+    # model_setting_path가 null이면 src/configs/model_setting.yaml을 읽는다.
+    model_setting_path: null
+    forecasting:
+      model_name: DLinear
+      model_parameters: {}
+      lookback_steps: 120
+      include_time_features: true
+      epochs: 20
+      batch_size: 128
+      learning_rate: 0.0001
+      weight_decay: 0.0005
+      patience: 5
+      min_delta: 0.00001
+      validation_fraction: 0.1
+      device: auto
+
+    minimum_test_power_r2: 0.7
+    maximum_rollout_power_wape_percent: 20.0
+    maximum_constraint_false_safe_rate_percent: 5.0
+    # false면 결과를 exploratory로 명시하고 계속 실행한다.
+    fail_on_low_quality: false
+
+  # Evaluator 모델 자체를 먼저 동일한 시간순 validation/test에서 비교한다.
+  # 모델 선택에는 validation만 사용하며 test 결과는 선택 후 보고에만 쓴다.
+  evaluator_benchmark:
+    model_families:
+      - extra_trees_residual_state
+      - random_forest_residual_state
+      - hist_gradient_boosting_residual_state
+      - neural_residual
+      - 'forecasting:DLinear'
+      - 'forecasting:PatchTST'
+      - 'forecasting:iTransformer'
+      - 'forecasting:MICN'
+      - 'forecasting:TimesNet'
+      - 'forecasting:TimeXer'
+    validation_max_windows: 0
+    test_max_windows: 0
+    evaluate_all_models_on_test: true
+    # validation에서 선택된 evaluator 한 개만 전체 1분 receding-horizon MPC에
+    # 연결한다. false이면 evaluator/action-scope benchmark까지만 수행한다.
+    run_full_mpc_for_selected: true
+    # Sequence evaluator는 희소한 action-grouped row만으로 120-step history를
+    # 만들기 어려우므로 고정-action/cross-fit 보조 평가는 이 모델로 분리한다.
+    full_mpc_auxiliary_evaluator_family: extra_trees_residual_state
+
+  # "모든 데이터"는 test를 학습에 넣는다는 뜻이 아니다. 시간순 train에서
+  # family를 학습하고 validation에서 고정한 뒤 모든 유효 test transition을
+  # action 필터 없이 한 번 평가한다.
+  all_test_data_evaluation:
+    enabled: true
+    target_mape_percent: 1.950
+    minimum_validation_mape_samples: 30
+    minimum_test_mape_samples: 30
+
+  # 기본 7/9/10/12 실험은 같은 outcome-blind action-episode holdout을 유지한다.
+  # 추가 시나리오는 명시된 support만 완화해 후보 수 민감도를 평가한다. 모든
+  # 시나리오는 train/validation/test episode를 완전히 분리하며 validation MAPE로
+  # 후보를 순위화하고 test Y는 후보 선정에 사용하지 않는다. 완화 기준과 실제
+  # 가용 후보 수는 각 scenario 결과에 함께 저장한다.
+  candidate_pool_experiments:
+    scenarios:
+      - name: previous_7
+        description: 기존 1.95% validation gate를 통과한 7개 조합 재현
+        maximum_validation_mape_percent_per_candidate: 1.950
+        maximum_candidates: 7
+      - name: expanded_9
+        description: validation MAPE 상위 9개 support 조합
+        maximum_validation_mape_percent_per_candidate: 100.0
+        maximum_candidates: 9
+      - name: expanded_10
+        description: validation MAPE 상위 10개 support 조합
+        maximum_validation_mape_percent_per_candidate: 100.0
+        maximum_candidates: 10
+      - name: expanded_12
+        description: support를 만족하는 전체 12개 조합
+        maximum_validation_mape_percent_per_candidate: 100.0
+        maximum_candidates: 12
+      - name: expanded_13
+        description: validation 최소 2개를 만족하는 13개 조합 확장 평가
+        classification: support_sensitivity
+        maximum_validation_mape_percent_per_candidate: 100.0
+        maximum_candidates: 13
+        holdout_overrides:
+          minimum_validation_samples_per_candidate: 2
+        candidate_pool_overrides:
+          minimum_validation_mape_samples_per_candidate: 2
+      - name: expanded_17
+        description: train 최소 3개와 validation 최소 2개를 만족하는 17개 조합 확장 평가
+        classification: support_sensitivity
+        maximum_validation_mape_percent_per_candidate: 100.0
+        maximum_candidates: 17
+        holdout_overrides:
+          minimum_training_samples_per_candidate: 3
+          minimum_validation_samples_per_candidate: 2
+        candidate_pool_overrides:
+          minimum_validation_mape_samples_per_candidate: 2
+      - name: exploratory_41
+        description: validation 최소 1개까지 허용한 41개 조합 탐색 평가
+        classification: exploratory_only
+        maximum_validation_mape_percent_per_candidate: 100.0
+        maximum_candidates: 41
+        holdout_overrides:
+          minimum_training_samples_per_candidate: 3
+          minimum_validation_samples_per_candidate: 1
+        candidate_pool_overrides:
+          minimum_validation_mape_samples_per_candidate: 1
+
+
+  # Train 3 / Validation 1 / Test 5 support를 만족하는 최대 41개 후보를
+  # validation MAPE 순서로 하나씩 누적한다. report model은 한 번 선택·고정하고
+  # 모든 K에서 같은 예측을 재사용한다. 공식 K는 validation 목표를 만족하는
+  # 가장 큰 K이며, 다른 K의 test 값은 민감도 분석으로만 해석한다.
+  candidate_pool_top_k_sweep:
+    enabled: true
+    name: top_k_1_to_41
+    description: validation으로 선택하는 누적 Top-1부터 Top-41 MAPE 곡선
+    minimum_k: 1
+    maximum_k: 41
+    step: 1
+    k_selection_rule: largest_k_within_validation_target
+    fallback_rule: minimum_validation_mape
+    minimum_pooled_validation_mape_samples: 1
+    holdout_overrides:
+      minimum_training_samples_per_candidate: 3
+      minimum_validation_samples_per_candidate: 1
+      minimum_test_exact_matches: 5
+    candidate_pool_overrides:
+      maximum_validation_mape_percent_per_candidate: 100.0
+      minimum_validation_mape_samples_per_candidate: 1
+      minimum_test_mape_samples_per_candidate: 5
+      minimum_pooled_test_mape_samples: 30
+      maximum_candidates: 41
+
+  objective:
+    # one-hot 변화량의 L1 비용. 불필요하게 잦은 switching을 억제한다.
+    switch_penalty: 0.05
+  solver:
+    time_limit_seconds: 60.0
+    mip_relative_gap: 0.01
+  evaluation:
+    # 1분마다 MPC를 다시 풀고 첫 제어만 적용하는 60분 폐루프 평가다.
+    closed_loop_steps: 60
+    stride: 60
+    # 0은 가능한 test window 전체를 뜻한다. smoke test는 양수로 제한한다.
+    max_windows: 0
+    lead_time_steps: [1, 10, 30, 60]
+    primary_baseline: recorded
+    restrict_to_training_control_support: true
+    minimum_policy_windows: 20
+    bootstrap_samples: 2000
+    bootstrap_confidence: 0.95
+    progress_interval_steps: 10
+
+    # 네 옵션은 서로 독립적으로 켜고 끌 수 있다. 모든 eligibility 판단은
+    # test target이 아닌 train의 제어 이력과 설정값만 사용한다.
+    action_options:
+      # 1. train에서 충분히 반복된 exact joint action만 MPC 후보로 허용한다.
+      repeated_joint_actions:
+        enabled: true
+        minimum_training_samples: 30
+        minimum_training_episodes: 3
+
+      # 2. 세분화된 카테고리를 기존 대표 카테고리로 통합한다.
+      # enabled=true이면 mappings를 반드시 하나 이상 지정해야 한다.
+      # 예: {냉난방설정온도(℃): {18: 22, 26: 22}}
+      category_consolidation:
+        enabled: false
+        mappings: {}
+
+      # 3. 시간순서는 유지하되 하나의 연속 joint-action episode가 서로 다른
+      # split/fold에 걸리지 않도록 경계를 가장 가까운 episode 사이로 이동한다.
+      episode_group_split:
+        enabled: true
+
+      # 4. false이면 보조 rolling cross-fit MAPE의 표본/context 기준은 유지하면서
+      # train 및 평가 episode 개수만 탈락 조건에서 제외한다.
+      exclude_insufficient_episode_actions:
+        enabled: true
+
+    # 시간 순서는 유지하되 동일 joint-action episode가 두 split에 걸치지 않도록
+    # 아래 기준으로 split support를 감사한다. 데이터를 복제하거나 미래 행을
+    # train으로 옮기는 용도가 아니다.
+    action_split_support:
+      minimum_samples_per_split: 30
+      minimum_complete_episodes_per_split: 3
+
+    # 단일 최적 joint action에 대한 진단 평가다. 결과 Y를 보지 않고 반복
+    # action episode를 평가 전용 train/validation/test로 분리한 뒤 validation에서
+    # 하나의 action을 확정한다. 최종 evaluator는 train+validation으로 학습 후
+    # 고정하고 test 동일 action의 실제 총전력과 예측 총전력으로 표준 MAPE를
+    # 계산한다. 공식 KPI 대표값은 아래 fixed_action_candidate_pool이 담당한다.
+    # 일반 MPC 학습·정책 평가는 계속 위의 시간순 8:1:1 split을 사용한다.
+    fixed_optimal_action_holdout:
+      enabled: true
+      # null이면 independent_evaluator.model_family을 사용한다.
+      model_family: null
+      split_strategy: action_episode_grouped
+      # 0이면 support 기준을 만족하는 모든 조합, 양수이면 관측 빈도 Top-K다.
+      top_k_actions: 0
+      # MAPE 후보 풀을 넓히되 action median을 계산할 최소 5개 train 표본과
+      # train/validation/test의 완전한 episode 분리는 유지한다. 현재 거실
+      # 데이터에서는 후보가 6개에서 12개로 확장된다.
+      minimum_training_samples_per_candidate: 5
+      minimum_training_episodes_per_candidate: 1
+      minimum_validation_samples_per_candidate: 3
+      minimum_validation_episodes_per_candidate: 1
+      minimum_test_exact_matches: 5
+      minimum_test_episodes_per_candidate: 1
+      minimum_test_mape_samples: 5
+      minimum_predicted_state_satisfaction_percent: 80.0
+      # 모든 후보가 실험용 상태 제약을 탈락해도 MAPE 계산 자체를 중단하지 않는다.
+      # 상태 만족률 허용범위 안에서 선호 조합과 최소전력을 사용하며, 엄격 제약
+      # 미통과는 별도 policy acceptance gate 실패로 남긴다.
+      allow_soft_constraint_fallback: true
+
+      # 환기와 냉난방이 모두 ON인 관측 조합을 우선한다. soft fallback에서도
+      # 상태 만족률 최댓값보다 1%p를 초과해 나쁜 후보는 ON이라는 이유만으로
+      # 선택하지 않는다. enabled=false이면 기존 상태/전력 규칙만 사용한다.
+      selection_preference:
+        enabled: true
+        preferred_values:
+          환기전원: 'ON'
+          냉난방전원: 'ON'
+        maximum_state_satisfaction_loss_percent: 1.0
+
+      # 공식 MAPE 계산에만 쓰는 direct total-power report model이다.
+      # MPC/MILP의 affine power model, 목적함수, 제약, action 선택에는 연결하지 않는다.
+      total_power_report_model:
+        enabled: true
+        target_mape_percent: 1.950
+        # 목표를 통과한 모델 중 가장 단순한 family를 사용한다. 목표를 통과한
+        # family가 없을 때만 validation MAPE가 가장 낮은 family로 fallback한다.
+        selection_rule: simplest_within_target
+        # 각 family는 grouped train으로만 학습한 뒤 selected action의 grouped
+        # validation MAPE로 선택한다. 선택 family만 train+validation으로 재학습해
+        # 고정한 후 test에 한 번 적용한다.
+        candidate_families:
+          - action_median
+          - action_median_huber_residual
+          - action_median_extra_trees_residual
+          - direct_total_extra_trees
+        minimum_validation_mape_samples: 3
+        # action별 baseline은 이 표본 수 이상일 때만 사용하고, 부족하거나 처음
+        # 보는 action은 train 전체 중앙값으로 fallback한다.
+        minimum_action_samples: 5
+        # Huber는 action median에서 남은 residual의 이상치 영향을 완화한다.
+        huber_epsilon: 1.35
+        huber_alpha: 0.0001
+        huber_max_iter: 500
+        # residual/direct ExtraTrees 공통 설정이다.
+        n_estimators: 300
+        min_samples_leaf: 3
+        max_features: 1.0
+        n_jobs: 1
+
+    # 공식 KPI는 validation MAPE 기준으로 고정한 여러 exact joint action의
+    # test 행을 합쳐 표준 sample-level MAPE로 계산한다. 단일 최적 action 평가는
+    # 위 fixed_optimal_action_holdout에 진단용으로 계속 남는다.
+    fixed_action_candidate_pool:
+      enabled: true
+      target_mape_percent: 1.950
+      # Candidate eligibility는 train-only action median의 validation 성능만
+      # 사용한다. test Y는 후보·model family 선택에 절대 사용하지 않는다.
+      selection_model_family: action_median
+      maximum_validation_mape_percent_per_candidate: 1.950
+      minimum_validation_mape_samples_per_candidate: 3
+      minimum_test_mape_samples_per_candidate: 5
+      minimum_pooled_test_mape_samples: 30
+      # 0이면 validation 기준을 통과한 후보를 모두 공식 pool에 포함한다.
+      maximum_candidates: 0
+
+    # 실제 장비에 새 제어를 적용할 수 없으므로, validation에서 실제 관측된
+    # 공동 제어 조합만 후보로 삼고 test의 동일 조합 실제 Y로 MAPE를 계산한다.
+    # 이전 시간순 민감도 분석용으로만 유지하며, 공식 대표값은 위
+    # fixed_action_candidate_pool이다.
+    observed_combination:
+      enabled: false
+      minimum_validation_samples_per_combination: 30
+      minimum_predicted_state_satisfaction_percent: 80.0
+      minimum_test_exact_matches: 30
+      minimum_test_mape_samples: 30
+
+    # MPC가 폐루프 평가에서 실제로 선택한 모든 joint action의 실제-Y 예측
+    # MAPE를 측정한다. 각 fold는 과거 데이터로만 학습하며 fold 안에서는
+    # evaluator를 고정한다. 조합이 같아도 상태·외란 context가 멀면 제외한다.
+    # 현재 기본값은 희소한 joint-action 데이터에서 지표 산출 가능성을
+    # 먼저 확인하는 탐색용 완화 기준이다. 최종 성능 보고 전에는 표본·coverage
+    # 기준을 다시 높이고, 해당 기준에서도 MAPE가 재현되는지 확인해야 한다.
+    selected_action_crossfit:
+      enabled: true
+      # null이면 independent_evaluator.model_family을 그대로 사용한다.
+      model_family: null
+      folds: 5
+      initial_training_fraction: 0.2
+      context_standardized_rms_distance_threshold: 1.0
+      minimum_context_matched_samples_per_action: 3
+      minimum_independent_episodes_per_action: 3
+      # 평가 행의 action이 그 fold의 과거 학습 구간에도 충분히 존재해야 한다.
+      minimum_fold_training_samples_per_action: 20
+      minimum_fold_training_episodes_per_action: 3
+      # 이 기준 미만이면 부분 MAPE는 diagnostic으로만 남기고 대표값은 null이다.
+      minimum_reportable_mpc_step_coverage_percent: 30.0
 
 
 TRAIN:
@@ -50,9 +462,24 @@ TRAIN:
   eval_epochs: 1
   log_epochs: 1
   log_eval_iter: 100
-  early_stopping_count: 5
+  # Early stopping waits long enough for one or more LR reductions to take effect.
+  early_stopping_count: 8
   early_stopping_metric: mse
-  lradj: type1
+  early_stopping_min_delta: 0.001
+  checkpoint_min_delta: 0.00001
+
+  # Validation-driven scheduling is more robust across heterogeneous models
+  # than halving the LR at every epoch. The LR never falls below min_lr.
+  lradj: reduce_on_plateau
+  lr_scheduler:
+    monitor: loss
+    mode: min
+    factor: 0.5
+    patience: 2
+    threshold: 0.001
+    threshold_mode: rel
+    cooldown: 0
+    min_lr: 0.000001
   resume: null
   return_output: true
   plot_result: false

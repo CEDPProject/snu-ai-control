@@ -1,3 +1,5 @@
+from models.common import select_target_channels, target_channel_indices
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,6 +81,7 @@ class Model(nn.Module):
         
         # Categorical embedding
         self.cat_emb_dim = configs.get('cat_emb_dim', 8)
+        self.target_channel_indices = target_channel_indices(configs, self.cat_emb_dim)
         
         if self.n_cat > 0:
             self.cat_embedding = nn.Linear(self.n_cat, self.n_cat * self.cat_emb_dim)
@@ -118,8 +121,10 @@ class Model(nn.Module):
         dec_out = self.projection(enc_out)
 
         # De-Normalization
-        dec_out = dec_out * (stdev[:, 0, :self.n_target].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
-        dec_out = dec_out + (means[:, 0, :self.n_target].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
+        target_stdev = select_target_channels(stdev, self.target_channel_indices)
+        target_means = select_target_channels(means, self.target_channel_indices)
+        dec_out = dec_out * target_stdev.repeat(1, self.pred_len + self.seq_len, 1)
+        dec_out = dec_out + target_means.repeat(1, self.pred_len + self.seq_len, 1)
         
         return dec_out[:, -self.pred_len:, :]
 

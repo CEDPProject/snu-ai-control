@@ -1,3 +1,5 @@
+from models.common import select_target_channels, target_channel_indices
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,6 +42,7 @@ class Model(nn.Module):
         
         # Categorical embedding
         self.cat_emb_dim = configs.get('cat_emb_dim', 8)
+        self.target_channel_indices = target_channel_indices(configs, self.cat_emb_dim)
         
         if self.n_cat > 0:
             self.cat_embedding = nn.Linear(self.n_cat, self.n_cat * self.cat_emb_dim)
@@ -80,7 +83,7 @@ class Model(nn.Module):
             dec_out = dec_out + means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1)
 
         # Select target features only
-        return dec_out[:, :, -self.n_target:]
+        return select_target_channels(dec_out, self.target_channel_indices)
 
     def forward(self, input_cat, input_num, input_ts=None):
         """
