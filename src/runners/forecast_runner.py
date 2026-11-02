@@ -7,6 +7,7 @@ from omegaconf import OmegaConf
 
 from exp_builder import training_dl, test_dl
 from data_provider import create_dataloader
+from data_provider.dataset_versions import dataset_label_from_cfg, versions_from_cfg
 from losses import create_criterion
 from optimizers import create_optimizer
 from models import create_model
@@ -47,8 +48,10 @@ def run_forecast(cfg):
     )
     
     # make save directory
+    data_label = dataset_label_from_cfg(cfg)
+    data_versions = versions_from_cfg(cfg)
     savedir = os.path.join(cfg.RESULT.savedir,
-                            cfg.DATASET.data_version,
+                            data_label,
                             cfg.DATASET.environment_name, 
                             cfg.MODEL.modelname, 
                             cfg.DEFAULT.exp_name)
@@ -66,8 +69,11 @@ def run_forecast(cfg):
     
     logger.info('Device: %s', _device_description(accelerator))
     logger.info(
-        'Experiment: model=%s | environment=%s | target=%s | input=%d | horizon=%d',
+        'Experiment: model=%s | data=%s | versions=%s | environment=%s | '
+        'target=%s | input=%d | horizon=%d',
         cfg.MODEL.modelname,
+        data_label,
+        list(data_versions),
         cfg.DATASET.environment_name,
         list(cfg.DATASET.target_features),
         cfg.DATASET.seq_len,
@@ -84,6 +90,10 @@ def run_forecast(cfg):
                             pin_memory               = cfg.DATASET.pin_memory,
                             drop_last                = cfg.DATASET.drop_last,
                             data_version             = cfg.DATASET.data_version,
+                            data_versions            = cfg.DATASET.get('data_versions'),
+                            merge_strategy           = cfg.DATASET.get('merge_strategy', 'segmented_concat'),
+                            prevent_cross_segment_windows = cfg.DATASET.get('prevent_cross_segment_windows', True),
+                            segment_split            = cfg.DATASET.get('segment_split', 'global'),
                             split_rate               = cfg.DATASET.split_rate,
                             seq_len                  = cfg.DATASET.seq_len,
                             stride_len               = cfg.DATASET.stride_len,

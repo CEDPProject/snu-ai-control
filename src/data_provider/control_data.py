@@ -2,12 +2,16 @@
 
 from dataclasses import dataclass, field
 from itertools import product
-from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 from omegaconf import OmegaConf
+
+from data_provider.dataset_versions import (
+    resolve_dataset_csv_path,
+    versions_from_cfg,
+)
 
 
 def _category_token(value) -> str:
@@ -153,6 +157,8 @@ class ControlData:
     disturbance_names: tuple[str, ...]
     power_names: tuple[str, ...]
     encoder: ControlEncoder
+    segment_ids: np.ndarray | None = None
+    source_versions: tuple[str, ...] = ()
     control_preprocessing: Dict[str, object] = field(default_factory=dict)
 
     def split_indices(self, split_rate: Sequence[float]) -> tuple[int, int]:
@@ -170,7 +176,12 @@ class ControlData:
             self.timestamps.iloc[start + 1 : end + 1].reset_index(drop=True)
             - self.timestamps.iloc[start:end].reset_index(drop=True)
         )
-        return delta.eq(pd.Timedelta(minutes=1)).to_numpy()
+        mask = delta.eq(pd.Timedelta(minutes=1)).to_numpy()
+        if self.segment_ids is not None:
+            current_segments = np.asarray(self.segment_ids[start:end])
+            next_segments = np.asarray(self.segment_ids[start + 1 : end + 1])
+            mask &= current_segments == next_segments
+        return mask
 
     def model_arrays(self, start: int, end: int):
         """Return x(t), z(t), d(t), x(t+1), and p(t) for valid transitions."""
@@ -200,7 +211,11 @@ class ControlData:
             self.timestamps.iloc[rows + 1].reset_index(drop=True)
             - self.timestamps.iloc[rows].reset_index(drop=True)
         )
-        return rows[delta.eq(pd.Timedelta(minutes=1)).to_numpy()]
+        mask = delta.eq(pd.Timedelta(minutes=1)).to_numpy()
+        if self.segment_ids is not None:
+            segments = np.asarray(self.segment_ids)
+            mask &= segments[rows] == segments[rows + 1]
+        return rows[mask]
 
     def model_arrays_for_rows(self, row_indices):
         """Return model arrays for explicit, leakage-auditable transition rows."""
@@ -216,20 +231,20 @@ class ControlData:
         )
 
 
-def _resolve_csv_path(cfg) -> Path:
-    base = Path(cfg.DATASET.datadir).expanduser()
-    src_dir = Path(__file__).resolve().parents[1]
-    candidates = [base, Path.cwd() / base, src_dir / base]
-    for candidate in candidates:
-        csv_path = (
-            candidate.resolve()
-            / cfg.DATASET.data_version
-            / f'{cfg.DATASET.environment_name}.csv'
+def _load_configured_frames(cfg) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    versions = versions_from_cfg(cfg)
+    frames = []
+    for segment_id, version in enumerate(versions):
+        csv_path = resolve_dataset_csv_path(
+            cfg.DATASET.datadir,
+            version,
+            cfg.DATASET.environment_name,
         )
-        if csv_path.is_file():
-            return csv_path
-    searched = ', '.join(str(path.resolve()) for path in candidates)
-    raise FileNotFoundError(f'MPC data directory was not found. Searched: {searched}')
+        frame = pd.read_csv(csv_path)
+        frame['__source_version'] = version
+        frame['__segment_id'] = segment_id
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True), versions
 
 
 def _fill_numeric(frame: pd.DataFrame, names: Sequence[str]) -> None:
@@ -363,16 +378,21 @@ def load_control_data(cfg) -> ControlData:
         *(variable.name for variable in encoder.variables),
     }
 
-    csv_path = _resolve_csv_path(cfg)
-    frame = pd.read_csv(csv_path)
+    frame, source_versions = _load_configured_frames(cfg)
+    merge_strategy = cfg.DATASET.get('merge_strategy', 'segmented_concat')
+    if len(source_versions) > 1 and merge_strategy != 'segmented_concat':
+        raise ValueError(
+            "Only DATASET.merge_strategy='segmented_concat' is supported for "
+            "multi-version MPC datasets"
+        )
     missing = sorted(required - set(frame.columns))
     if missing:
         raise ValueError(f'MPC data is missing required columns: {missing}')
 
     frame['데이터 시간'] = pd.to_datetime(frame['데이터 시간'], errors='raise')
     frame = (
-        frame.sort_values('데이터 시간')
-        .drop_duplicates('데이터 시간', keep='last')
+        frame.sort_values(['__segment_id', '데이터 시간'])
+        .drop_duplicates(['__segment_id', '데이터 시간'], keep='last')
         .reset_index(drop=True)
     )
 
@@ -383,6 +403,7 @@ def load_control_data(cfg) -> ControlData:
     if end_date is not None:
         frame = frame[frame["데이터 시간"] <= pd.Timestamp(end_date)]
     frame = frame.reset_index(drop=True)
+    segment_ids = frame['__segment_id'].to_numpy(dtype=int)
 
     for variable in encoder.variables:
         frame[variable.name] = frame[variable.name].map(_category_token)
@@ -413,7 +434,10 @@ def load_control_data(cfg) -> ControlData:
         disturbance_names=disturbance_names,
         power_names=power_names,
         encoder=encoder,
+        segment_ids=segment_ids,
+        source_versions=tuple(source_versions),
         control_preprocessing={
             'category_consolidation': category_consolidation,
+            'source_versions': list(source_versions),
         },
     )

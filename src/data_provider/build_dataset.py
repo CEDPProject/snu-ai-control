@@ -16,9 +16,13 @@ class HVACDataset(Dataset):
         categorical_feature: list = None,
         numerical_feature: list = None,
         feature_indices: dict = None,
+        segment_ids=None,
+        prevent_cross_segment_windows: bool = True,
     ):
         self.data = data
         self.timestamps = timestamps  # 추가
+        self.segment_ids = segment_ids
+        self.prevent_cross_segment_windows = bool(prevent_cross_segment_windows)
         self.seq_len = int(seq_len)
         self.pred_len = int(pred_len)
         self.stride_len = max(1, int(stride_len))
@@ -92,13 +96,29 @@ class HVACDataset(Dataset):
         # 한 샘플 길이/개수
         self.total_len = self.seq_len + self.pred_len
         max_start = len(self.data) - self.total_len
-        self.n_samples = 0 if max_start < 0 else (max_start // self.stride_len) + 1
+        if max_start < 0:
+            self.start_indices = np.empty(0, dtype=int)
+        else:
+            candidate_starts = np.arange(0, max_start + 1, self.stride_len, dtype=int)
+            if self.prevent_cross_segment_windows and self.segment_ids is not None:
+                segments = np.asarray(self.segment_ids)
+                if len(segments) != len(self.data):
+                    raise ValueError("segment_ids must have the same length as data")
+                valid_starts = [
+                    int(start)
+                    for start in candidate_starts
+                    if np.all(segments[start : start + self.total_len] == segments[start])
+                ]
+                self.start_indices = np.asarray(valid_starts, dtype=int)
+            else:
+                self.start_indices = candidate_starts
+        self.n_samples = len(self.start_indices)
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, idx):
-        start   = idx * self.stride_len
+        start   = int(self.start_indices[idx])
         x_begin = start
         x_end   = x_begin + self.seq_len
         y_begin = x_end
@@ -146,5 +166,6 @@ class HVACDataset(Dataset):
             "pred_len": self.pred_len,
             "stride_len": self.stride_len,
             "n_samples": len(self),
+            "prevent_cross_segment_windows": self.prevent_cross_segment_windows,
             "feature_indices": self.feature_indices,
         }

@@ -12,11 +12,26 @@ def parser():
     cli = argparse.ArgumentParser(description='snu-ai-control')
     cli.add_argument(
         '--task',
-        choices=('forecast', 'mpc', 'evaluator_benchmark'),
+        choices=(
+            'forecast',
+            'mpc',
+            'evaluator_benchmark',
+            'action_stratified_evaluation',
+            'report_model_input_ablation',
+            'counterfactual_report_input_ablation',
+            'action_distance_ablation',
+            'action_history_ablation',
+            'control_benchmark',
+        ),
         default='forecast',
         help=(
-            'Run forecasting, the full MPC pipeline, or the evaluator/action-scope '
-            'benchmark. Forecasting and MPC share data, not execution.'
+            'Run forecasting, the full MPC pipeline, the evaluator/action-scope '
+            'benchmark, the supplementary action-stratified row evaluation, the '
+            'observed-action report-model input ablation, the counterfactual '
+            'report-model input ablation, or the recorded-action anchored '
+            'Full-guard distance sweep, or the applied-action-history '
+            'constraint matrix (lookback, hard distance, grouping, penalty). '
+            'Forecasting and MPC share data, not execution.'
         ),
     )
     cli.add_argument('--model_name', type=str, help='Forecast model name')

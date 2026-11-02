@@ -2,6 +2,7 @@
 
 import json
 import logging
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict, Sequence
 
@@ -14,6 +15,13 @@ from controllers.action_crossfit import (
     chronological_action_split_support,
     control_episode_ids,
     evaluate_mpc_selected_action_crossfit,
+)
+from controllers.action_model_screen import ActionModelScreen
+from controllers.action_selection_gate import ActionSelectionGate
+from controllers.action_trust import ActionTrustEligibility
+from controllers.report_action_effect_gate import (
+    ReportActionEffectGate,
+    ReportActionEffectGateConfig,
 )
 from controllers.evaluation import (
     AffinePlantAdapter,
@@ -41,6 +49,11 @@ from controllers.fixed_action_evaluation import (
     evaluate_fixed_optimal_action_holdout,
 )
 from controllers.mixed_integer_mpc import MixedIntegerMPC
+from controllers.total_power_evaluation import (
+    evaluate_mpc_counterfactual_total_power_report,
+    fit_frozen_chronological_total_power_model,
+    policy_window_transition_rows,
+)
 from data_provider.control_data import ControlData, load_control_data
 from dynamics.affine import fit_affine_models
 from dynamics.evaluator_base import history_for_rollout
@@ -310,6 +323,161 @@ def _training_control_support(
         'forbidden_by_milp_no_good_cuts': int(len(forbidden)),
         'actions': action_support,
     }
+
+
+def _plain_mapping(value) -> Dict[str, object]:
+    """Copy an OmegaConf mapping before deriving train/validation thresholds."""
+    if value is None:
+        return {}
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return dict(value)
+
+
+def _build_calibrated_action_trust(
+    data: ControlData,
+    *,
+    train_end: int,
+    test_start: int,
+    raw_config,
+    logical_rules,
+    candidate_controls: np.ndarray,
+) -> tuple[ActionTrustEligibility, Dict[str, object]]:
+    """Build a train-only trust index and calibrate optional radius on validation.
+
+    A local distance threshold is intentionally derived from validation *input
+    contexts and recorded controls only*.  It uses neither validation power nor
+    state targets, and never inspects any test row.  This avoids a hidden
+    arbitrary radius while preserving a strict no-test-leakage contract.
+    """
+    specification = deepcopy(_plain_mapping(raw_config))
+    specification.setdefault('enabled', False)
+    local = specification.setdefault('local_context_support', {})
+    if OmegaConf.is_config(local):
+        local = OmegaConf.to_container(local, resolve=True)
+        specification['local_context_support'] = local
+    local = dict(local or {})
+    specification['local_context_support'] = local
+    metadata: Dict[str, object] = {
+        'configured': deepcopy(specification),
+        'calibration_scope': (
+            'chronological validation rows, using only state/disturbance/control '
+            'and a train-only support index'
+        ),
+        'uses_validation_power_targets': False,
+        'uses_validation_next_state_targets': False,
+        'uses_test_rows_or_targets': False,
+    }
+    local_enabled = bool(local.get('enabled', False))
+    radius = local.get('maximum_standardized_rms_distance')
+    if radius is None:
+        radius = local.get('maximum_context_distance')
+    mean_k_threshold = local.get('maximum_mean_k_distance')
+    if local_enabled and (radius is None or mean_k_threshold is None):
+        minimum_calibration_contexts = int(
+            local.get('minimum_validation_contexts', 30)
+        )
+        if minimum_calibration_contexts <= 0:
+            raise ValueError(
+                'action_trust.local_context_support.minimum_validation_contexts '
+                'must be positive'
+            )
+        provisional = deepcopy(specification)
+        provisional_local = dict(provisional['local_context_support'])
+        provisional_local['enabled'] = False
+        provisional['local_context_support'] = provisional_local
+        preliminary = ActionTrustEligibility.build_from_chronological_train_end(
+            data,
+            train_end,
+            provisional,
+            logical_rules=logical_rules,
+            candidate_controls=candidate_controls,
+        )
+        # A transition at ``test_start - 1`` has x(t+1) in the test split.
+        # Keep the calibration boundary identical to the ordinary validation
+        # model metrics: [train_end, test_start - 1) as source rows.
+        validation_rows = data.valid_transition_rows(
+            np.arange(
+                int(train_end),
+                max(int(train_end), int(test_start) - 1),
+                dtype=int,
+            )
+        )
+        nearest_values = []
+        mean_k_values = []
+        for row in validation_rows:
+            decision = preliminary.evaluate(
+                data.controls[row],
+                data.states[row],
+                data.disturbances[row],
+            )
+            if not decision.eligible:
+                continue
+            local_metadata = decision.local_support
+            nearest = local_metadata.get('nearest_context_distance')
+            mean_k = local_metadata.get('mean_k_nearest_context_distance')
+            if nearest is not None and np.isfinite(nearest):
+                nearest_values.append(float(nearest))
+            if mean_k is not None and np.isfinite(mean_k):
+                mean_k_values.append(float(mean_k))
+        quantile = float(local.get('calibration_quantile', 0.95))
+        if not 0.0 < quantile <= 1.0:
+            raise ValueError(
+                'action_trust.local_context_support.calibration_quantile '
+                'must be in (0, 1]'
+            )
+        if len(nearest_values) >= minimum_calibration_contexts:
+            if radius is None:
+                local['maximum_standardized_rms_distance'] = float(
+                    np.quantile(nearest_values, quantile)
+                )
+            if mean_k_threshold is None:
+                local['maximum_mean_k_distance'] = float(
+                    np.quantile(mean_k_values or nearest_values, quantile)
+                )
+            metadata['local_context_calibration'] = {
+                'status': 'calibrated',
+                'eligible_validation_context_count': int(len(nearest_values)),
+                'minimum_validation_contexts': minimum_calibration_contexts,
+                'quantile': quantile,
+                'maximum_standardized_rms_distance': local.get(
+                    'maximum_standardized_rms_distance'
+                ),
+                'maximum_mean_k_distance': local.get(
+                    'maximum_mean_k_distance'
+                ),
+            }
+        else:
+            # A q95 estimated from only a handful of action-matched contexts
+            # looks numerically precise but is not a robust operating limit.
+            # Preserve global support and explicitly record why local support
+            # was not enforceable for this chronological split.
+            local['enabled'] = False
+            metadata['local_context_calibration'] = {
+                'status': (
+                    'disabled_insufficient_eligible_validation_contexts'
+                ),
+                'eligible_validation_context_count': int(len(nearest_values)),
+                'minimum_validation_contexts': minimum_calibration_contexts,
+            }
+    else:
+        metadata['local_context_calibration'] = {
+            'status': (
+                'configured_explicit_threshold'
+                if local_enabled
+                else 'disabled'
+            ),
+        }
+
+    trust = ActionTrustEligibility.build_from_chronological_train_end(
+        data,
+        train_end,
+        specification,
+        logical_rules=logical_rules,
+        candidate_controls=candidate_controls,
+    )
+    metadata['resolved'] = trust.config.to_metadata()
+    return trust, metadata
 
 
 def _minimum_defined(values: Sequence[float | None]) -> float | None:
@@ -641,7 +809,7 @@ def _policy_acceptance(
     }, warnings
 
 
-def run_mpc_pipeline(cfg, result_dir: Path):
+def run_mpc_pipeline(cfg, result_dir: Path, *, control_backend=None):
     """Fit affine control models and evaluate MPC on an independent plant."""
     np.random.seed(int(cfg.DEFAULT.seed))
     if int(cfg.MPC.sample_interval_minutes) != 1:
@@ -652,6 +820,13 @@ def run_mpc_pipeline(cfg, result_dir: Path):
     LOGGER.info('Loading chronological control data')
     data = load_control_data(cfg)
     evaluation_cfg = cfg.MPC.evaluation
+    report_refit_scope = str(
+        OmegaConf.select(
+            evaluation_cfg,
+            'report_model_refit_scope',
+            default='train_validation',
+        )
+    )
     action_options_cfg = evaluation_cfg.action_options
     repeated_action_cfg = action_options_cfg.repeated_joint_actions
     episode_group_cfg = action_options_cfg.episode_group_split
@@ -750,6 +925,10 @@ def run_mpc_pipeline(cfg, result_dir: Path):
         power_alpha=cfg.MPC.affine_models.power_ridge_alpha,
     )
     affine_plant = AffinePlantAdapter(state_model, power_model)
+    if control_backend is not None:
+        state_model, power_model, affine_plant = control_backend.attach(
+            data, train_end, test_start, state_model, power_model,
+        )
     affine_metrics = {
         'train': _one_step_metrics(
             data,
@@ -917,6 +1096,7 @@ def run_mpc_pipeline(cfg, result_dir: Path):
             target_mape_percent=float(
                 fixed_action_cfg.total_power_report_model.target_mape_percent
             ),
+            report_model_refit_scope=report_refit_scope,
         )
         fixed_action_model_comparison_rows = (
             fixed_action_evaluation.get('total_power_model_selection') or {}
@@ -1062,6 +1242,7 @@ def run_mpc_pipeline(cfg, result_dir: Path):
             ),
             mape_min_actual_power_w=mape_threshold,
             random_state=int(cfg.DEFAULT.seed) + 200,
+            report_model_refit_scope=report_refit_scope,
         )
         candidate_pool_model_comparison_rows = (
             candidate_pool_evaluation.get('total_power_model_selection') or {}
@@ -1376,25 +1557,355 @@ def run_mpc_pipeline(cfg, result_dir: Path):
         support_metadata['allowed_mpc_combination_count'],
         support_metadata['forbidden_by_milp_no_good_cuts'],
     )
+
+    # The static MILP candidate pool remains the train-supported exact joint
+    # actions above.  The following gate is narrower and context dependent:
+    # it can only remove a first action when the current (x_t, d_t) has too
+    # little train support or when a validation-calibrated independent-model
+    # screen rejects it.  Neither calibration path reads test targets.
+    action_trust_cfg = evaluation_cfg.get('action_trust')
+    if action_trust_cfg is None:
+        action_trust_cfg = {'enabled': False}
+    action_trust, action_trust_calibration = _build_calibrated_action_trust(
+        data,
+        train_end=train_end,
+        test_start=test_start,
+        raw_config=action_trust_cfg,
+        logical_rules=cfg.MPC.logical_rules,
+        candidate_controls=observed_support,
+    )
+
+    action_model_screen_cfg = evaluation_cfg.get('action_model_screen')
+    if action_model_screen_cfg is None:
+        action_model_screen_cfg = {'enabled': False}
+    action_model_screen_spec = _plain_mapping(action_model_screen_cfg)
+    action_model_screen_enabled = bool(action_model_screen_spec.get('enabled'))
+    screen_validation_evaluator = independent_evaluator
+    screen_validation_evaluator_metadata = None
+    if action_model_screen_enabled:
+        LOGGER.info(
+            'Fitting train-only evaluator for action-screen calibration: '
+            'family=%s | validation=[%d,%d)',
+            evaluator_cfg.model_family,
+            train_end,
+            max(train_end, test_start - 1),
+        )
+        screen_validation_evaluator = create_independent_evaluator(
+            evaluator_cfg,
+            data,
+            train_end,
+            random_state=int(cfg.DEFAULT.seed) + 701,
+        )
+        screen_validation_evaluator_metadata = (
+            screen_validation_evaluator.to_metadata()
+        )
+    screen_validation_rows = np.arange(
+        int(train_end),
+        max(int(train_end), int(test_start) - 1),
+        dtype=int,
+    )
+    action_model_screen = ActionModelScreen.calibrate(
+        data,
+        validation_rows=screen_validation_rows,
+        affine_power_model=power_model,
+        validation_evaluator=screen_validation_evaluator,
+        state_constraints=cfg.MPC.state_constraints,
+        config=action_model_screen_cfg,
+    ).bind_affine_power_model(power_model)
+
+    # This optional gate is deliberately evaluated outside the MILP.  The
+    # frozen report model is selected on the chronological validation slice
+    # only, then it restricts the finite z_0 candidate pool by its predicted
+    # change from the already-applied reference action.  Therefore test power
+    # targets are never available to either the gate or the solver.
+    report_action_effect_cfg = evaluation_cfg.get('report_action_effect_gate')
+    if report_action_effect_cfg is None:
+        report_action_effect_cfg = {'enabled': False}
+    report_action_effect_config = ReportActionEffectGateConfig.from_mapping(
+        report_action_effect_cfg
+    )
+    report_action_effect_gate = None
+    report_action_effect_model_selection = None
+    if report_action_effect_config.enabled:
+        report_train_rows = np.arange(0, train_end - 1, dtype=int)
+        report_validation_rows = np.arange(
+            train_end,
+            test_start - 1,
+            dtype=int,
+        )
+        LOGGER.info(
+            'Fitting frozen report model for first-action effect gate: '
+            'train=%d | validation=%d | total_limit=%s%% | component_limit=%s%%',
+            len(data.valid_transition_rows(report_train_rows)),
+            len(data.valid_transition_rows(report_validation_rows)),
+            report_action_effect_config.maximum_total_relative_change_percent,
+            report_action_effect_config.maximum_component_relative_change_percent,
+        )
+        report_action_effect_model_selection = (
+            fit_frozen_chronological_total_power_model(
+                data,
+                training_rows=report_train_rows,
+                validation_rows=report_validation_rows,
+                report_model_config=(
+                    cfg.MPC.evaluation.fixed_optimal_action_holdout
+                    .total_power_report_model
+                ),
+                minimum_actual_power_w=mape_threshold,
+                target_mape_percent=float(
+                    cfg.MPC.evaluation.fixed_optimal_action_holdout
+                    .total_power_report_model.target_mape_percent
+                ),
+                minimum_validation_samples=int(
+                    cfg.MPC.evaluation.fixed_optimal_action_holdout
+                    .total_power_report_model.minimum_validation_mape_samples
+                ),
+                random_state=int(cfg.DEFAULT.seed) + 911,
+            )
+        )
+        report_action_effect_gate = ReportActionEffectGate(
+            report_action_effect_model_selection.model,
+            data.power_names,
+            report_action_effect_config,
+        )
+    action_selection_gate = ActionSelectionGate(
+        action_trust,
+        action_model_screen,
+        report_action_effect_gate,
+    )
+    action_gate_metadata = {
+        **action_selection_gate.to_metadata(),
+        'action_trust_calibration': action_trust_calibration,
+        'model_screen_calibration_evaluator': (
+            screen_validation_evaluator_metadata
+        ),
+        'candidate_pool_source': (
+            'static training-supported exact joint actions passed to MILP'
+        ),
+        'candidate_pool_count_before_context_screen': int(len(observed_support)),
+        'report_action_effect_model_selection': (
+            None
+            if report_action_effect_model_selection is None
+            else report_action_effect_model_selection.to_metadata()
+        ),
+    }
+    LOGGER.info(
+        'Action gate ready: trust_enabled=%s | screen_enabled=%s | '
+        'report_effect_enabled=%s | static_candidates=%d | screen_calibration=%s',
+        action_trust.config.enabled,
+        action_model_screen.config.enabled,
+        report_action_effect_config.enabled,
+        len(observed_support),
+        action_model_screen.calibration_metadata.get('status'),
+    )
     LOGGER.info(
         'Building mixed-integer controller: solver_time_limit=%.3fs | '
         'mip_gap=%.6f',
         float(cfg.MPC.solver.time_limit_seconds),
         float(cfg.MPC.solver.mip_relative_gap),
     )
+    action_history_cfg = _plain_mapping(
+        cfg.MPC.objective.get('action_history')
+    )
     controller = MixedIntegerMPC(
-        state_model=state_model,
-        power_model=power_model,
+        state_model=getattr(state_model, 'affine_reference', state_model),
+        power_model=getattr(power_model, 'affine_reference', power_model),
         encoder=data.encoder,
         state_constraints=cfg.MPC.state_constraints,
         logical_rules=cfg.MPC.logical_rules,
         prediction_horizon=cfg.MPC.prediction_horizon,
         control_horizon=cfg.MPC.control_horizon,
         switch_penalty=cfg.MPC.objective.switch_penalty,
+        maximum_changed_control_variables_per_step=(
+            cfg.MPC.objective.get(
+                'maximum_changed_control_variables_per_step',
+                None,
+            )
+        ),
+        action_history_enabled=bool(action_history_cfg.get('enabled', False)),
+        action_history_lookback_steps=int(
+            action_history_cfg.get('lookback_steps', 0)
+        ),
+        action_history_penalty=float(action_history_cfg.get('penalty', 0.0)),
+        action_history_recency_weights=action_history_cfg.get(
+            'recency_weights'
+        ),
+        action_history_group_definitions=action_history_cfg.get('groups'),
+        action_history_rolling_change_budget=action_history_cfg.get(
+            'rolling_change_budget'
+        ),
+        action_history_per_group_rolling_change_budgets=action_history_cfg.get(
+            'per_group_rolling_change_budgets'
+        ),
+        action_history_budget_slack_penalty=float(
+            action_history_cfg.get('rolling_budget_slack_penalty', 1000.0)
+        ),
         time_limit_seconds=cfg.MPC.solver.time_limit_seconds,
         mip_relative_gap=cfg.MPC.solver.mip_relative_gap,
         forbidden_control_vectors=forbidden_controls,
     )
+    if control_backend is not None:
+        controller = control_backend.wrap_controller(controller, observed_support)
+
+    counterfactual_cfg = evaluation_cfg.get(
+        'mpc_counterfactual_total_power_report'
+    )
+    if counterfactual_cfg is None:
+        counterfactual_cfg = OmegaConf.create({'enabled': False})
+    counterfactual_report_evaluation = {
+        'available': False,
+        'reportable': False,
+        'reason': (
+            'Disabled by '
+            'MPC.evaluation.mpc_counterfactual_total_power_report.enabled'
+        ),
+        'protocol': {
+            'name': 'mpc_selected_action_counterfactual_total_power_mape',
+        },
+        'model_selection': None,
+        'primary_metric': {
+            'name': 'mpc_action_vs_recorded_actual_total_power_mape_percent',
+            'value': None,
+            'unit': 'percent',
+            'reportable': False,
+        },
+        'mape_cases': {
+            'mpc_action_vs_recorded_actual': {
+                'name': 'mpc_action_vs_recorded_actual_total_power_mape_percent',
+                'value': None,
+                'unit': 'percent',
+                'reportable': False,
+            },
+            'mpc_action_vs_recorded_action_report': {
+                'name': 'mpc_action_vs_recorded_action_report_mape_percent',
+                'value': None,
+                'unit': 'percent',
+                'reportable': False,
+            },
+        },
+        'component_mape_cases': {
+            'mpc_action_vs_recorded_actual': None,
+            'mpc_action_vs_recorded_action_report': None,
+        },
+        'test_evaluation': None,
+        'estimated_energy_reduction': None,
+        'report_to_report_predicted_energy_reduction': None,
+    }
+    counterfactual_report_rows = []
+    counterfactual_action_candidate_rows = []
+    if bool(counterfactual_cfg.enabled):
+        row_scope = str(
+            counterfactual_cfg.get('evaluation_row_scope', 'policy_windows')
+        )
+        if row_scope == 'policy_windows':
+            counterfactual_rows = policy_window_transition_rows(
+                data,
+                starts,
+                duration_steps,
+            )
+        elif row_scope == 'all_chronological_test':
+            counterfactual_rows = data.valid_transition_rows(
+                np.arange(test_start, len(data.states) - 1, dtype=int)
+            )
+        else:
+            raise ValueError(
+                'MPC.evaluation.mpc_counterfactual_total_power_report.'
+                'evaluation_row_scope must be policy_windows or '
+                f'all_chronological_test, got {row_scope!r}'
+            )
+        row_stride = int(counterfactual_cfg.row_stride_steps)
+        maximum_rows = int(counterfactual_cfg.maximum_evaluation_rows)
+        if row_stride <= 0:
+            raise ValueError(
+                'mpc_counterfactual_total_power_report.row_stride_steps '
+                'must be positive'
+            )
+        if maximum_rows < 0:
+            raise ValueError(
+                'mpc_counterfactual_total_power_report.maximum_evaluation_rows '
+                'must be zero (all) or positive'
+            )
+        counterfactual_rows = counterfactual_rows[::row_stride]
+        if maximum_rows:
+            counterfactual_rows = counterfactual_rows[:maximum_rows]
+        report_train_rows = np.arange(0, train_end - 1, dtype=int)
+        report_validation_rows = np.arange(
+            train_end,
+            test_start - 1,
+            dtype=int,
+        )
+        LOGGER.info(
+            'MPC counterfactual total-power report started: rows=%d | '
+            'report_model=train+validation frozen before test',
+            len(counterfactual_rows),
+        )
+        counterfactual_report_model = fit_frozen_chronological_total_power_model(
+            data,
+            training_rows=report_train_rows,
+            validation_rows=report_validation_rows,
+            report_model_config=(
+                cfg.MPC.evaluation.fixed_optimal_action_holdout
+                .total_power_report_model
+            ),
+            minimum_actual_power_w=mape_threshold,
+            target_mape_percent=float(counterfactual_cfg.target_mape_percent),
+            minimum_validation_samples=int(
+                counterfactual_cfg.minimum_validation_mape_samples
+            ),
+            random_state=int(cfg.DEFAULT.seed),
+        )
+        (
+            counterfactual_report_evaluation,
+            counterfactual_report_rows,
+        ) = evaluate_mpc_counterfactual_total_power_report(
+            data,
+            controller,
+            counterfactual_report_model,
+            evaluation_rows=counterfactual_rows,
+            disturbance_forecast_method=cfg.MPC.disturbance_forecast,
+            training_control_support=observed_support,
+            minimum_actual_power_w=mape_threshold,
+            minimum_test_mape_samples=int(
+                counterfactual_cfg.minimum_test_mape_samples
+            ),
+            target_mape_percent=float(counterfactual_cfg.target_mape_percent),
+            sample_interval_minutes=int(cfg.MPC.sample_interval_minutes),
+            progress_interval=int(evaluation_cfg.progress_interval_steps),
+            action_gate=action_selection_gate,
+            evaluator=independent_evaluator,
+            candidate_diagnostic_rows=counterfactual_action_candidate_rows,
+            first_action_reference=str(
+                counterfactual_cfg.get(
+                    'first_action_reference',
+                    'recorded_previous_action',
+                )
+            ),
+        )
+        counterfactual_metric = (
+            counterfactual_report_evaluation.get('primary_metric') or {}
+        )
+        report_to_report_metric = (
+            (counterfactual_report_evaluation.get('mape_cases') or {}).get(
+                'mpc_action_vs_recorded_action_report'
+            )
+            or {}
+        )
+        report_to_report_reduction = (
+            counterfactual_report_evaluation.get(
+                'report_to_report_predicted_energy_reduction'
+            )
+            or {}
+        )
+        LOGGER.info(
+            'MPC dual total-power report complete: actual_baseline_mape=%s | '
+            'report_to_report_mape=%s | report_to_report_reduction_percent=%s | '
+            'action_changed_percent=%s',
+            counterfactual_metric.get('value'),
+            report_to_report_metric.get('value'),
+            report_to_report_reduction.get('estimated_reduction_percent'),
+            (
+                counterfactual_report_evaluation.get('test_evaluation') or {}
+            ).get('action_changed_percent'),
+        )
 
     model_validation = {
         'data_split': {
@@ -1415,6 +1926,7 @@ def run_mpc_pipeline(cfg, result_dir: Path):
             'one_step': evaluator_metrics,
             'recursive_recorded_control_rollout': evaluator_rollout_metrics,
         },
+        'first_action_selection_gate': action_gate_metadata,
         'evaluator_model_comparison': {
             'requested': bool(configured_candidates),
             'selection_protocol': (
@@ -1433,6 +1945,7 @@ def run_mpc_pipeline(cfg, result_dir: Path):
     first_action_rows = []
     closed_loop_step_rows = []
     all_solver_records = []
+    closed_loop_action_candidate_rows = []
     mpc_evaluator_power_windows = []
     mpc_affine_power_windows = []
     mpc_control_windows = []
@@ -1485,6 +1998,7 @@ def run_mpc_pipeline(cfg, result_dir: Path):
             duration_steps,
             cfg.MPC.disturbance_forecast,
             observed_support,
+            action_gate=action_selection_gate,
             progress_prefix=f'window {window_number}/{len(starts)}',
             progress_interval=evaluation_cfg.progress_interval_steps,
         )
@@ -1592,6 +2106,9 @@ def run_mpc_pipeline(cfg, result_dir: Path):
         mpc_state_context_windows.append(mpc_trajectory['states'][:-1])
         mpc_disturbance_context_windows.append(disturbances.copy())
         all_solver_records.extend(mpc_trajectory['step_records'])
+        closed_loop_action_candidate_rows.extend(
+            mpc_trajectory['candidate_diagnostic_rows']
+        )
         for record in mpc_trajectory['step_records']:
             closed_loop_step_rows.append(
                 {'window_timestamp': timestamp, **record}
@@ -1606,6 +2123,10 @@ def run_mpc_pipeline(cfg, result_dir: Path):
                 'solver_fallback_count': solver['fallback_count'],
             }
         )
+        if control_backend is not None:
+            control_backend.window_completed(
+                window_number, len(starts), window_result, mpc_trajectory['step_records'],
+            )
         LOGGER.info(
             'MPC closed-loop window %d/%d completed: mpc_energy_wh=%.6f | '
             'recorded_energy_wh=%.6f | mean_solve_seconds=%.6f | fallbacks=%d',
@@ -1771,6 +2292,33 @@ def run_mpc_pipeline(cfg, result_dir: Path):
             'actions': [],
         }
 
+    all_action_candidate_rows = (
+        counterfactual_action_candidate_rows
+        + closed_loop_action_candidate_rows
+    )
+    action_gate_diagnostics = {
+        'artifact': 'mpc_action_candidate_diagnostics.csv',
+        'candidate_decision_row_count': int(len(all_action_candidate_rows)),
+        'counterfactual_candidate_decision_row_count': int(
+            len(counterfactual_action_candidate_rows)
+        ),
+        'closed_loop_candidate_decision_row_count': int(
+            len(closed_loop_action_candidate_rows)
+        ),
+        'eligible_candidate_decision_count': int(
+            sum(bool(row.get('eligible', False)) for row in all_action_candidate_rows)
+        ),
+        'rejected_candidate_decision_count': int(
+            sum(not bool(row.get('eligible', False)) for row in all_action_candidate_rows)
+        ),
+        'row_semantics': (
+            'One row per static exact-action candidate and evaluated MPC '
+            'first-action context; rejection reasons use train support or '
+            'validation-calibrated independent-model checks only.'
+        ),
+        'test_target_usage': False,
+    }
+
     policy_aggregate = _aggregate_policy_results(
         window_results,
         str(evaluation_cfg.primary_baseline),
@@ -1841,6 +2389,51 @@ def run_mpc_pipeline(cfg, result_dir: Path):
             'evaluator_disturbance_source': 'actual future observations',
             'optimization_model': 'affine state and power models',
             'evaluation_plant': active_evaluator_label,
+            'first_action_selection_gate': (
+                'train-only global/local action support plus '
+                'validation-calibrated independent-model screen'
+            ),
+            'first_action_selection_gate_metadata_artifact': (
+                'action_selection_gate.json'
+            ),
+            'maximum_changed_control_variables_per_plan_step': (
+                controller.maximum_changed_control_variables_per_step
+            ),
+            'action_history_regularization': {
+                'enabled': controller.action_history_enabled,
+                'lookback_steps': controller.action_history_lookback_steps,
+                'penalty': controller.action_history_penalty,
+                'recency_weights': (
+                    list(controller.action_history_recency_weights)
+                    if controller.action_history_recency_weights is not None
+                    else None
+                ),
+                'groups': [
+                    {
+                        'name': name,
+                        'feature_names': [
+                            data.encoder.feature_names[index]
+                            for index in features
+                        ],
+                    }
+                    for name, features in controller.action_history_groups
+                ],
+                'rolling_change_budget': (
+                    controller.action_history_rolling_change_budget
+                ),
+                'per_group_rolling_change_budgets': (
+                    controller.action_history_per_group_rolling_change_budgets
+                ),
+                'rolling_budget_slack_penalty': (
+                    controller.action_history_budget_slack_penalty
+                ),
+                'history_source_closed_loop': (
+                    'bootstrap recorded actions before the window, then '
+                    'previously applied MPC actions'
+                    if controller.action_history_enabled
+                    else None
+                ),
+            },
             'action_options': OmegaConf.to_container(
                 action_options_cfg,
                 resolve=True,
@@ -1861,6 +2454,9 @@ def run_mpc_pipeline(cfg, result_dir: Path):
             'observed_combination_protocol': (
                 observed_combination_evaluation['protocol']
             ),
+            'mpc_counterfactual_total_power_report_protocol': (
+                counterfactual_report_evaluation['protocol']
+            ),
             'counterfactual_limit': (
                 'Results remain simulated and are not proof of real equipment savings'
             ),
@@ -1869,6 +2465,8 @@ def run_mpc_pipeline(cfg, result_dir: Path):
         'quality_warnings': quality_warnings,
         'kpi_assessment': kpi_assessment,
         'control_support': support_metadata,
+        'action_selection_gate': action_gate_metadata,
+        'action_gate_diagnostics': action_gate_diagnostics,
         'chronological_action_split_support': action_split_support,
         'primary_metric': official_metric,
         'primary_metric_source': official_metric_source,
@@ -1881,6 +2479,9 @@ def run_mpc_pipeline(cfg, result_dir: Path):
         ),
         'mpc_selected_action_crossfit_evaluation': (
             selected_action_crossfit_evaluation
+        ),
+        'mpc_counterfactual_total_power_report_evaluation': (
+            counterfactual_report_evaluation
         ),
         'affine_power_model_test_mape': {
             key: value
@@ -1918,12 +2519,30 @@ def run_mpc_pipeline(cfg, result_dir: Path):
         'windows': window_results,
     }
 
+    if control_backend is not None:
+        summary['control_backend'] = control_backend.metadata()
+        summary['framework'] = 'interchangeable control model + original full MPC evaluation'
+        summary['evaluation_protocol']['optimization_model'] = control_backend.model.family
+        summary['evaluation_protocol']['planner_family'] = control_backend.settings['planner']
+        if control_backend.settings['planner'] == 'categorical_cem':
+            summary['evaluation_protocol']['binary_control_variables_per_solve'] = None
+            summary['evaluation_protocol']['optimal_success_count_scope'] = (
+                'No MILP/global-optimum certificate for CEM; feasible plans are counted as incumbents'
+            )
+        summary['evaluation_protocol']['legacy_affine_keys'] = (
+            'affine_* output keys describe the selected controller model; '
+            'non-affine model JSON files are checkpoint references, not affine matrices'
+        )
     _write_json(result_dir / 'affine_state_model.json', state_model.to_dict())
     _write_json(result_dir / 'affine_power_model.json', power_model.to_dict())
     _write_json(result_dir / 'affine_model_metrics.json', affine_metrics)
     _write_json(
         result_dir / 'independent_evaluator_metadata.json',
         independent_evaluator.to_metadata(),
+    )
+    _write_json(
+        result_dir / 'action_selection_gate.json',
+        action_gate_metadata,
     )
     _write_json(result_dir / 'model_validation.json', model_validation)
     _write_json(
@@ -1946,6 +2565,10 @@ def run_mpc_pipeline(cfg, result_dir: Path):
             'enabled': False,
         },
     )
+    _write_json(
+        result_dir / 'mpc_counterfactual_total_power_report_evaluation.json',
+        counterfactual_report_evaluation,
+    )
     _write_json(result_dir / 'mpc_evaluation.json', summary)
     pd.DataFrame(first_action_rows).to_csv(
         result_dir / 'mpc_first_actions.csv',
@@ -1954,6 +2577,97 @@ def run_mpc_pipeline(cfg, result_dir: Path):
     )
     pd.DataFrame(closed_loop_step_rows).to_csv(
         result_dir / 'mpc_closed_loop_steps.csv',
+        index=False,
+        encoding='utf-8-sig',
+    )
+    pd.DataFrame(counterfactual_report_rows).to_csv(
+        result_dir / 'mpc_counterfactual_total_power_report_predictions.csv',
+        index=False,
+        encoding='utf-8-sig',
+    )
+    # 방안 2(지표 조정): 성분별·총전력을 설정 floor로 MAPE/WAPE 계산하고 ≤target
+    # pass/fail을 판정한다(실제 action·MPC action 예측 모두). report model 예측
+    # 정확도이며 제어 절감이 아니다.
+    component_kpi_gate_cfg = cfg.MPC.get('component_kpi_gate')
+    if component_kpi_gate_cfg is not None and bool(
+        component_kpi_gate_cfg.get('enabled', False)
+    ):
+        from controllers.component_kpi_gate import (
+            component_kpi_gate_from_counterfactual,
+            summarize_gate,
+        )
+        gate_floor_w = float(component_kpi_gate_cfg.get('mape_floor_w', 5.0))
+        gate_target_percent = float(
+            component_kpi_gate_cfg.get('target_percent', 1.950)
+        )
+        component_kpi_gate_rows = component_kpi_gate_from_counterfactual(
+            pd.DataFrame(counterfactual_report_rows),
+            list(data.power_names),
+            floor_w=gate_floor_w,
+            target_percent=gate_target_percent,
+        )
+        pd.DataFrame(component_kpi_gate_rows).to_csv(
+            result_dir / 'component_kpi_gate.csv',
+            index=False,
+            encoding='utf-8-sig',
+        )
+        _write_json(
+            result_dir / 'component_kpi_gate.json',
+            {
+                'floor_w': gate_floor_w,
+                'target_percent': gate_target_percent,
+                'rows': component_kpi_gate_rows,
+                'summary': summarize_gate(component_kpi_gate_rows),
+            },
+        )
+    vent_isolated_cfg = cfg.MPC.get('vent_isolated_kpi')
+    if (
+        vent_isolated_cfg is not None
+        and bool(vent_isolated_cfg.get('enabled', False))
+        and counterfactual_report_rows
+    ):
+        from controllers.evaluation import resolve_report_model_refit_rows
+        from controllers.vent_isolated_kpi import (
+            summarize_vent_isolated,
+            vent_isolated_kpi_from_counterfactual,
+        )
+        vent_floor_w = float(vent_isolated_cfg.get('mape_floor_w', 5.0))
+        vent_target_percent = float(
+            vent_isolated_cfg.get('target_percent', 1.950)
+        )
+        vent_refit_rows = resolve_report_model_refit_rows(
+            data,
+            np.arange(0, int(train_end), dtype=int),
+            np.arange(int(train_end), int(test_start), dtype=int),
+            test_rows=np.arange(
+                int(test_start), len(data.states), dtype=int
+            ),
+            scope=report_refit_scope,
+        )
+        vent_isolated_rows = vent_isolated_kpi_from_counterfactual(
+            data,
+            pd.DataFrame(counterfactual_report_rows),
+            vent_refit_rows,
+            floor_w=vent_floor_w,
+            target_percent=vent_target_percent,
+        )
+        pd.DataFrame(vent_isolated_rows).to_csv(
+            result_dir / 'vent_isolated_kpi.csv',
+            index=False,
+            encoding='utf-8-sig',
+        )
+        _write_json(
+            result_dir / 'vent_isolated_kpi.json',
+            {
+                'floor_w': vent_floor_w,
+                'target_percent': vent_target_percent,
+                'report_model_refit_scope': report_refit_scope,
+                'rows': vent_isolated_rows,
+                'summary': summarize_vent_isolated(vent_isolated_rows),
+            },
+        )
+    pd.DataFrame(all_action_candidate_rows).to_csv(
+        result_dir / 'mpc_action_candidate_diagnostics.csv',
         index=False,
         encoding='utf-8-sig',
     )
@@ -2237,6 +2951,57 @@ def run_mpc_pipeline(cfg, result_dir: Path):
                     'combination_balanced_metric', {}
                 ).get('value')
             ),
+        },
+        'mpc_counterfactual_total_power_mape': {
+            'reportable': counterfactual_report_evaluation['reportable'],
+            'total_power_mape_percent': (
+                counterfactual_report_evaluation.get('primary_metric') or {}
+            ).get('value'),
+            'target_achieved': (
+                counterfactual_report_evaluation.get('primary_metric') or {}
+            ).get('target_achieved'),
+            'evaluated_transition_count': (
+                counterfactual_report_evaluation.get('test_evaluation') or {}
+            ).get('evaluated_transition_count'),
+            'valid_mape_coverage_percent': (
+                counterfactual_report_evaluation.get('test_evaluation') or {}
+            ).get('valid_mape_coverage_percent'),
+            'action_changed_percent': (
+                counterfactual_report_evaluation.get('test_evaluation') or {}
+            ).get('action_changed_percent'),
+            'estimated_reduction_percent': (
+                counterfactual_report_evaluation.get(
+                    'estimated_energy_reduction'
+                )
+                or {}
+            ).get('estimated_reduction_percent'),
+            'report_to_report_total_power_mape_percent': (
+                (counterfactual_report_evaluation.get('mape_cases') or {}).get(
+                    'mpc_action_vs_recorded_action_report', {}
+                ).get('value')
+            ),
+            'report_to_report_predicted_reduction_percent': (
+                counterfactual_report_evaluation.get(
+                    'report_to_report_predicted_energy_reduction'
+                )
+                or {}
+            ).get('estimated_reduction_percent'),
+            'component_mape_cases': counterfactual_report_evaluation.get(
+                'component_mape_cases'
+            ),
+            'estimated_reduction_by_power_output': (
+                counterfactual_report_evaluation.get(
+                    'estimated_energy_reduction'
+                )
+                or {}
+            ).get('by_power_output'),
+            'report_to_report_predicted_reduction_by_power_output': (
+                counterfactual_report_evaluation.get(
+                    'report_to_report_predicted_energy_reduction'
+                )
+                or {}
+            ).get('by_power_output'),
+            'reason': counterfactual_report_evaluation.get('reason'),
         },
         'chronological_action_split_support': {
             'observed_action_count': action_split_support[

@@ -136,3 +136,51 @@ src/saved_model/
 # saved model artifacts at repo root
 /saved_model/
 /saved_model_pre_robust_20260715_0040/
+/saved_model_pre_rerun_20260817/
+
+
+# experiment outputs / reports / test packages (not published)
+/reports/
+/kpi_release/
+/saved_model*/
+/src/jupyter/*.csv
+
+# data files (never commit datasets or derived predictions)
+*.csv
+*.tsv
+*.npy
+*.npz
+*.parquet
+*.feather
+*.xlsx
+*.xls
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.ckpt
+*.sqlite
+*.db
+
+# run bookkeeping
+*.pid
+*.marker
+nohup.out
+wandb/
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# coding-agent files (Claude Code, Codex, etc.)
+AGENTS.md
+CLAUDE.md
+CLAUDE.local.md
+NOTES.md
+.claude/
+.codex/
+.cursor/
+.aider*

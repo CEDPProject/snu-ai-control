@@ -17,15 +17,16 @@ iTransformer:
 
 MICN:
   d_model: 128                   # model dimension
-  n_heads: 8                     # number of attention heads (for MIC layers)
-  e_layers: 2                    # number of encoder layers
-  d_ff: 256                      # feedforward dimension
+  n_heads: 8                     # unused by MICN (kept for config compatibility)
+  e_layers: 2                    # unused by MICN
+  d_ff: 256                      # unused by MICN (MIC feed-forward is 4 * d_model)
   d_layers: 1                    # number of MIC layers
-  dropout: 0.05                  # dropout rate
+  dropout: 0.05                  # dropout rate (embedding and MIC layers)
   embed: 'fixed'                 # time features encoding
   freq: 'h'                      # freq for time features
   conv_kernel: [12, 16]          # downsampling/upsampling convolution kernels
   cat_emb_dim: 8                 # embedding dimension per categorical feature
+  use_norm: false                # RevIN-style per-window normalization (true = de-normalize with target stats)
 
 PatchTST:
   d_model: 128                   # model dimension

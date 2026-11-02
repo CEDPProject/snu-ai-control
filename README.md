@@ -11,11 +11,167 @@
 ## 설치
 
 ```bash
+git clone https://github.com/CEDPProject/snu-ai-control.git
+cd snu-ai-control
 pip install -r requirements.txt
+```
+
+모든 명령은 저장소 루트에서 실행합니다. 테스트는 합성 데이터만 사용하므로 데이터 없이 돌릴 수 있습니다.
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests
 ```
 
 MPC는 SciPy에 포함된 HiGHS MILP solver를 사용하므로 별도의 상용 solver나
 `cvxpy` 설치가 필요하지 않습니다.
+
+## 데이터 형식
+
+이 저장소에는 **데이터, 학습된 모델, 실험 결과가 포함되어 있지 않습니다.** 아래 형식에 맞춰 준비한 데이터를
+사용하세요. 기본 설정은 "한 공간(방)에 설치된 환기·냉난방 장비의 분 단위 운전 기록" 형태를 가정하지만,
+열 이름과 제어 변수를 설정 파일에서 바꾸면 비슷한 구조의 건물 HVAC 데이터에 그대로 적용할 수 있습니다.
+
+### 1. 폴더 구조
+
+```text
+<datadir>/
+└── <data_version>/              # 예: site_a_2025summer
+    ├── <environment_name>.csv   # 공간 1개 = CSV 1개 (예: livingroom.csv)
+    ├── room1.csv
+    └── ...
+```
+
+| 설정 (`src/configs/default_setting.yaml`) | 기본값 | 설명 |
+|---|---|---|
+| `DATASET.datadir` | `../../data/kweather/` | 데이터 루트. 절대경로, 실행 위치 기준 상대경로, `src/` 기준 상대경로 순으로 찾음 |
+| `DATASET.data_version` | `version3_260714_processed` | `<datadir>` 아래 하위 폴더 이름 |
+| `DATASET.environment_name` | `livingroom` | 사용할 CSV 파일 이름(확장자 제외) |
+| `DATASET.data_versions` | `null` | 여러 수집 회차를 함께 쓸 때 폴더 이름 목록. 각 회차는 별도 segment로 이어 붙이며 segment 경계를 넘는 window·transition은 만들지 않음 |
+
+데이터는 저장소 밖에 두고 실행할 때 덮어쓰는 것을 권장합니다.
+
+```bash
+python src/main.py --task forecast --model_name DLinear --opts \
+  DATASET.datadir=/path/to/data DATASET.data_version=site_a DATASET.environment_name=room1
+```
+
+### 2. CSV 열 구성
+
+한 행은 한 시각의 관측값과 그때 적용된 제어 상태입니다. 열은 역할에 따라 다섯 종류로 나뉘며,
+각 역할에 어떤 열을 쓸지는 모두 설정 파일에서 지정합니다.
+
+| 역할 | 설정 키 | 기본 예시 (단위) | 사용처 |
+|---|---|---|---|
+| 시각 | (고정) `데이터 시간` | `2025-08-04 00:00:00` | 정렬·중복 제거·분할 |
+| 상태 (state) | `MPC.state_constraints[].name` | 실내 온도(℃), 습도(%), CO2(ppm), PM10·PM2.5(㎍/㎥), VOC(ppb) | 제약 대상, 예측 입력 |
+| 외란 (disturbance) | `MPC.disturbance_variables` | 실외 온도·습도·PM10·PM2.5 | 상태 변화의 외부 요인 |
+| 전력 (power) | `MPC.power_variables`, `DATASET.target_features` | 환기·냉난방 유효전력(W) | 최소화 대상, 예측 타깃 |
+| 제어 (control) | `MPC.control_variables` | 전원 ON/OFF, 풍량 단계, 운전 모드, 설정온도 | MPC가 고르는 이산 action |
+
+예측(forecast)에서는 열을 자료형 기준으로 다시 지정합니다.
+
+- `DATASET.numerical_features`: 수치 입력. **타깃 열도 반드시 포함**해야 합니다.
+- `DATASET.categorical_features`, `DATASET.ord_categorical_feature`: 문자열·순서형 범주 입력.
+  `cat_encode_method`(`label` 또는 `onehot`)로 인코딩합니다.
+- `DATASET.target_features`: 예측할 열.
+- `DATASET.ignore_feature`: 입력에서 뺄 열.
+
+예시 (일부 열, 1분 간격):
+
+```csv
+데이터 시간,실내온도(℃),실내습도(%),실내이산화탄소(ppm),실외온도(℃),실외습도(%),환기전원,환기풍량,냉난방전원,냉난방운전모드,냉난방설정온도(℃),환기유효전력(W),냉난방유효전력(W)
+2025-08-04 00:00:00,26.1,58.0,640,27.3,81.0,ON,2,ON,냉방,26,18.5,412.0
+2025-08-04 00:01:00,26.0,58.2,642,27.3,81.0,ON,2,ON,냉방,26,18.4,409.7
+```
+
+### 3. 데이터 요구사항
+
+- **시각 열 이름**은 `데이터 시간`으로 고정되어 있습니다. 다른 이름이면 CSV에서 바꾸거나
+  `src/data_provider/load_dataset.py`, `src/data_provider/control_data.py`를 수정하세요.
+  `pandas.to_datetime`으로 읽을 수 있는 형식이면 되며, 같은 시각이 여러 번 나오면 마지막 행만 남깁니다.
+- **샘플 간격**: MPC는 **1분 간격**을 요구합니다(`MPC.sample_interval_minutes: 1`). 정확히 1분 차이인 연속 행만
+  transition으로 사용하므로 결측 구간이 있어도 되지만, 다른 간격의 데이터는 미리 1분으로 리샘플링해야 합니다.
+  예측은 행 단위 window(`seq_len`, `pred_len`)를 쓰므로 간격을 검사하지 않습니다.
+- **제어 열의 값**은 `MPC.control_variables[].categories`에 적은 값 중 하나여야 합니다. 범주에 없는 값이 있으면
+  오류가 나고, 빈 값은 `default`로 채웁니다. 숫자 범주는 문자열로 맞춰 비교합니다(예: `4.0` → `"4"`).
+- **장비 논리 규칙**(`MPC.logical_rules`): 예를 들어 "전원 OFF이면 풍량 0" 같은 규칙으로 중복 조합을 없앱니다.
+  기록 데이터가 `forbid` 규칙을 어기면 오류가 나므로, 자신의 장비에 맞게 규칙을 고치거나 비워 두세요(`[]`).
+- **단위**: MPC는 스케일하지 않은 물리 단위를 그대로 사용합니다. 예측은 학습 구간으로 맞춘 scaler
+  (`DATASET.scaler: standard|minmax`)를 씁니다.
+- **결측**: 예측은 segment별로 앞·뒤 값으로 채운 뒤 수치는 0, 범주는 `unknown`으로 채웁니다.
+  MPC는 수치 열을 보간한 뒤에도 남는 결측이 있으면 오류를 냅니다.
+- **이상치**: 예측 로더는 `환기유효전력(W)`, `냉난방유효전력(W)`이 1000 W를 넘는 행을 제거합니다
+  (`load_dataset.py`의 `outlier_thresholds`). 다른 타깃은 99.9 백분위수를 기준으로 합니다. 장비 용량에 맞게 고치세요.
+- **분할**: `start_date`/`end_date`로 기간을 자르고, `split_date`가 있으면 날짜로, 없으면 `split_rate`
+  (기본 `[0.8, 0.1, 0.1]`) 비율로 시간 순 분할합니다. 기본 `start_date`는 예시 데이터에 맞춘 값이므로
+  자신의 데이터에서는 `null`이나 적절한 날짜로 바꾸세요.
+
+### 4. 내 데이터에 적용하기
+
+1. CSV를 `<datadir>/<data_version>/<공간>.csv`로 두고 시각 열 이름을 `데이터 시간`으로 맞춥니다.
+2. `default_setting.yaml`에서 상태·외란·전력·제어 열과 제약 범위를 자신의 열 이름으로 바꿉니다.
+   최소 구성은 상태 1개, 전력 1개, 제어 변수 1개입니다. 예를 들어 제어 변수가 운전 모드 하나뿐이라면:
+
+   ```yaml
+   MPC:
+     disturbance_variables: [outdoor_temp]
+     power_variables: [power]
+     control_variables:
+       - {name: mode, categories: ['OFF', 'ON'], default: 'OFF'}
+     logical_rules: []
+     state_constraints:
+       - {name: indoor_temp, lower: 20.0, upper: 26.0, penalty: 100.0}
+   ```
+
+   같은 형태의 합성 데이터로 전체 파이프라인을 돌리는 예가 `tests/test_control_benchmark.py`에 있습니다.
+3. 예측을 쓴다면 `DATASET.numerical_features`, `categorical_features`, `ord_categorical_feature`,
+   `target_features`도 같은 열 이름으로 바꿉니다.
+4. 열 이름에 의존하는 부분이 남아 있으니, 기본 열 이름이 아니라면 아래도 확인하세요.
+   - 냉난방 전력 성분 추정: `independent_evaluator.component_power.hvac_component_name` 설정,
+     `src/dynamics/component_power_evaluator.py`, `src/controllers/fixed_action_power_models.py`
+     (`냉난방`, `hvac`, `cooling` 등의 이름 토큰으로 판별)
+   - 환기 전용 KPI: `src/controllers/vent_isolated_kpi.py` (`환기`로 시작하는 제어·전력 열)
+   - 물리 residual 제어 모델: `src/models/control/neural.py` (장비 열 이름과 범주 값)
+   - ablation runner의 결과 키: `src/runners/action_distance_ablation_runner.py`,
+     `src/runners/action_history_ablation_runner.py`
+5. `src/scripts/preprocessing/prepare_*.py`는 원본 수집 데이터(공간별 엑셀)를 위 CSV 형식으로 바꾸는 예시입니다.
+   자신의 원본 형식에 맞게 참고해서 작성하세요.
+
+### 5. 로컬 산출물
+
+다음 폴더는 실행 중에 만들어지며 `.gitignore`로 저장소에서 제외됩니다.
+
+- `saved_model/`: 학습한 모델, 설정, 지표, MPC 평가 결과
+- `reports/`: 일괄 실험 로그, 비교 결과, 보고서·그림
+- `kpi_release/`: `src/scripts/kpi/` 성능 평가 스크립트의 결과
+
+## 모델 폴더 분리와 제어 6종 비교
+
+- 전력 예측 모델 구현: `src/models/prediction/`
+- 제어용 상태·전력 모델 구현: `src/models/control/`
+- 기존 `models.MICN`, `models.create_model` 등의 import는 호환 shim으로 유지합니다.
+
+기존 forecast/MPC 실행을 유지하면서 6종의 **축소 예비 비교**를 실행하려면:
+
+```bash
+bash src/scripts/control/run_six_control_methods.sh
+```
+
+**원본 설정 전체 비교**(v3/v4/v5/concat × 3개 공간 × 6개 방법, 72개 조합)는:
+
+```bash
+bash src/scripts/control/run_six_control_methods_full.sh
+```
+
+원본 60-step 폐루프·가능한 전체 창·solver 60초/1%·guard/gate/report 평가를 재사용한다.
+장시간 실행의 상태·재시작 정보와 산출물은 `reports/artifacts/control_full_benchmark/` 아래에
+저장된다(로컬 산출물이며 저장소에는 포함하지 않는다).
+
+`CONTROL_BENCHMARK.selected_methods`로 기준선·모드/이력·물리 residual·scenario
+ensemble·비선형 categorical CEM·decision-focused 중 선택합니다.
+공통 시간 분할과 독립 surrogate에서 평가하며 실제 장비 절감 실증은 아닙니다.
+방법별 구현은 `src/models/control/`, 비교 실행은 `src/controllers/control_benchmark.py`와
+`src/controllers/full_control_backend.py`에 있습니다.
 
 ## 실행
 
@@ -43,6 +199,21 @@ python src/main.py --task mpc --opts \
 
 결과는 기본적으로
 `saved_model/<data_version>/<environment>/mpc/<experiment>/`에 저장됩니다.
+여러 데이터 버전을 함께 쓰는 경우에는
+`saved_model/<version_a>__<version_b>/<environment>/...`처럼 병합 label 아래에
+저장됩니다.
+
+여러 회차 데이터를 하나의 실험에 사용할 때는 `DATASET.data_versions`를 명시합니다.
+각 version은 하나의 segment로 취급되며, forecast sample은 segment 경계를 넘지
+않습니다. MPC transition도 같은 segment 안의 1분 간격만 유효합니다.
+
+```bash
+python src/main.py --task forecast --model_name PatchTST --opts \
+  'DATASET.data_versions=[version3_260714_processed,version4_260805_processed]'
+
+python src/main.py --task mpc --opts \
+  'DATASET.data_versions=[version3_260714_processed,version4_260805_processed]'
+```
 
 - `affine_state_model.json`: 최적화용 상태 동역학 계수와 열 이름
 - `affine_power_model.json`: 최적화용 독립 affine 전력 모델
@@ -100,7 +271,88 @@ nonnegative slack과 위반 비용을 둡니다. 기준값이 과도하거나 �
 독립 evaluator에는 실제 미래 외란을 한 step씩 적용하여 외란 예측 오차를 숨기지
 않습니다. `perfect`는 controller에 실제 미래 외란을 주는 상한선 실험입니다.
 
+### 최근 적용 action 이력 기반 완화 제어
+
+기본 MPC는 직전 action과의 one-step switching penalty만 사용한다. 최근 설정 이력
+전체에서 급격히 벗어나는 action을 억제해야 할 때는
+`MPC.objective.action_history`를 활성화한다. `lookback_steps: 5`는 현재 first
+action을 1, 2, 3, 4, 5분 전의 **실제 적용 action**과 모두 비교한다는 뜻이다.
+
+```text
+J = J_MPC + λ_history × Σ(l=1..L) w_l × D(z_t, z_(t-l)^applied)
+```
+
+`D`는 원시 one-hot bit 수가 아니라 환기·냉난방 장비 설정 묶음의 차이를 센다.
+따라서 냉난방 OFF canonicalization으로 풍량·운전모드·온도가 함께 대표값으로
+바뀌어도 하나의 냉난방 장비 설정 변경으로 해석한다. 추가로 최근 5분의 장비 단위
+변화량을 `rolling_change_budget`으로 제한하며, 과거 이력만으로 budget이 이미
+초과된 경우에는 큰 penalty의 slack을 남겨 MILP infeasible을 피한다.
+
+폐루프에서는 window 시작 전의 관측 action으로 history를 bootstrap한 뒤, 첫 step
+부터는 이전에 MPC가 실제 적용한 action만 history에 추가한다. 미래의 기록 action은
+읽지 않는다. 반면 행별 counterfactual 진단은 독립 행 평가이므로 해당 행 이전의
+기록 action을 bootstrap으로만 사용하며 CSV에 그 source를 명시한다.
+
+다음 스크립트는 categorical 변경 cap을 7(제어변수 전체)로 열고, 기본 5분 history
+regularizer를 활성화한다.
+
+```bash
+./src/scripts/control/run_history_smoothed_mpc.sh
+
+# 10분 history 민감도 실행
+LOOKBACK_STEPS=10 ./src/scripts/control/run_history_smoothed_mpc.sh
+```
+
+모든 비교값 `L={0,1,2,5,10,30}`을 같은 Full guard 조건으로 순차 실행하려면
+아래 runner를 사용한다. `L=0`은 현재 기록 action을 고정한 factual 기준선이고,
+`L>0`은 바로 이전 action부터 L분 이력까지를 함께 보는 history-smoothed MPC다.
+각 L의 MPC action trace에는 세 report-model 입력 bundle이 모두 적용된다.
+
+```bash
+GPU_ID=1 ./src/scripts/control/run_action_history_ablation.sh
+```
+
+산출물은 `saved_model/<data>/<environment>/action_history_ablation/<run>/`에
+분리된다. `lookback_summary.csv`는 L별 MPC trace 요약,
+`lookback_input_report_summary.csv`는 L×3 입력 bundle별 환기·냉난방·총전력
+action-effect MAPE, `action_history_ablation_report.md`는 사람이 읽는 요약이다.
+L>0 간에는 recency weight 합을 같은 값으로 정규화하고 rolling change budget을
+시간 길이에 비례시켜, 단순히 L이 큰 실험에 더 큰 regularization이 걸리지 않게 한다.
+
+`mpc_closed_loop_steps.csv`의 `action_history_*` 열과
+`mpc_evaluation.json`의 `solver.action_history`에서 lag별 거리, 가중 거리, 5분
+누적 변화량, budget overflow를 감사할 수 있다. 기본 `run_basic_mpc.sh`는 이전
+실험 재현성을 위해 이 기능을 비활성화한 상태로 유지한다.
+
 ## MPC 평가 프로토콜
+
+### 기본 실행: Full guard와 세 입력 report-model 결과를 함께 저장
+
+`./src/scripts/control/run_basic_mpc.sh`의 기본값은 06 **Full guard**다. 즉
+component two-stage HVAC evaluator, train-only global/local action support gate,
+validation 보정 model screen, 한 step당 최대 세 categorical 변수 변경 제한을
+동시에 적용한다. 이 기본값을 바꾸지 않는 한 별도 `--opts`가 없어도 적용된다.
+
+MPC가 완료되면 저장된 first-action trace를 reference로 하여 report model의 세 입력
+구성을 순차적으로 모두 재학습·평가한다.
+
+1. `현재 상태 + action + 현재 외란`
+2. `현재 상태 + action`
+3. `action만`
+
+이 post-evaluation은 MILP를 다시 풀지 않는다. 세 case는 동일한 test row,
+state, disturbance, Full-guard MPC action을 공유하고 report model 입력만 다르다.
+따라서 `report(x, z_MPC, d)`와 `report(x, z_recorded, d)`의 action-effect MAPE를
+입력 구성별로 공정하게 비교할 수 있다. 산출물 경로와 action-trace hash는 원 MPC
+결과의 `mpc_counterfactual_report_input_ablation_manifest.json`에 기록되고, 세 case의
+상세 수치는 연결된 `counterfactual_report_input_ablation_summary.csv`에 저장된다.
+
+smoke test에서만 아래처럼 후속 sweep을 끌 수 있다.
+
+```bash
+./src/scripts/control/run_basic_mpc.sh --opts \
+  MPC.counterfactual_report_input_ablation.run_after_mpc=false
+```
 
 평가 모델은 최적화에 사용한 Affine 모델과 분리합니다. controller는 chronological
 train 약 80%에서 학습한 Affine 상태·전력 모델을 사용합니다. 기본값에서는 명목
@@ -183,8 +435,9 @@ iTransformer, MICN, PatchTST, TimesNet, TimeXer, FreTS, Koopa, TimeMixer, TSMixe
    평가 전용 train/validation/test 중 하나에 배정합니다. 따라서 같은 episode나 행이
    둘 이상의 split에 들어가지 않습니다.
 2. train·validation·test에 각각 최소 support를 확보할 수 있는 관측 action만 후보로
-   두고 전체 관측 빈도 Top-K를 남깁니다. 기본값은 Top-8, 후보별 train 20표본·3개
-   episode, validation 3표본·3개 episode, test 30표본·3개 episode입니다.
+   둡니다. 기본값은 support를 만족하는 모든 action(`top_k_actions=0`)이며, 후보별
+   train 5표본·1개 episode, validation 3표본·1개 episode, test 5표본·1개 episode가
+   필요합니다.
 3. 선택용 evaluator는 grouped train 행으로만 학습하고 고정합니다. 모든 후보를
    동일한 validation 상태·외란 context에 순전파하여 예측 joint-state 만족률과
    예측 총 공조전력을 계산합니다. 설정한 만족률을 통과한 후보 중 예측 전력이 가장
@@ -194,7 +447,7 @@ iTransformer, MICN, PatchTST, TimesNet, TimeXer, FreTS, Koopa, TimeMixer, TSMixe
    선택합니다. 이 경우 MAPE 계산은 계속하지만 별도의 policy acceptance 상태 제약
    gate는 실패하므로 안전한 최적 제어로 주장할 수 없습니다.
 5. 공식 총전력 report model 후보(`action_median`, Huber residual, ExtraTrees
-   residual, direct-total ExtraTrees)는 grouped train으로만 학습하고, 확정 action의
+   residual, component-aware ExtraTrees)는 grouped train으로만 학습하고, 확정 action의
    grouped validation MAPE로 하나를 선택합니다. family 선택에 test Y는 사용하지
    않습니다.
 6. 선택 family를 grouped train+validation으로 재학습하고 파라미터를 고정합니다.
@@ -203,9 +456,60 @@ iTransformer, MICN, PatchTST, TimesNet, TimeXer, FreTS, Koopa, TimeMixer, TSMixe
    선택에 연결되지 않으며, 기존 component-sum evaluator 결과는 비교 진단으로 남깁니다.
 
 ```text
+report(x_t, z_t, d_t) = [환기유효전력(W), 냉난방유효전력(W)]
 total_power = 환기유효전력(W) + 냉난방유효전력(W)
 MAPE(%) = 100 / n × sum(|actual - predicted| / |actual|)
 ```
+
+`total_power_report_model`은 두 성분을 **동시에 직접 예측**하고, 총전력은 두
+성분 예측값의 합으로 계산한다. 따라서 모든 report-model 산출물은 총전력 MAPE를
+대표값으로 유지하면서도 `환기유효전력(W)`, `냉난방유효전력(W)` 각각의 MAPE/WAPE/MAE,
+유효 MAPE 표본 수와 행별 실제·예측값을 함께 기록한다.
+
+입력 묶음은 `MPC.evaluation.fixed_optimal_action_holdout.total_power_report_model
+.input_features`에서 독립적으로 선택한다.
+
+```yaml
+input_features:
+  current_state: true       # x_t: 실내 상태 6개
+  action: true              # z_t: 7개 categorical control의 one-hot 20개
+  current_disturbance: true # d_t: 실외 외란 4개
+```
+
+기본값은 세 묶음 모두 사용한다. 최소 한 묶음은 켜야 하며, counterfactual MPC
+비교에서 `action: false`이면 기록 action과 MPC action의 report 예측이 동일해지므로
+제어 효과를 해석할 수 없다. 입력 선택·차원·실제 feature 이름은 결과 JSON의
+`model_selection.model.input_features`에 남는다.
+
+세 입력 조합의 component MAPE를 비교하려면 아래 task를 실행한다.
+
+```bash
+bash src/scripts/control/run_report_model_input_ablation.sh
+```
+
+기본 case는 `현재 상태+action+현재 외란`, `현재 상태+action`, `action만`이다.
+각 case는 같은 시간순 train/validation/test split에서 family를 validation으로 선택하고,
+기록 test action의 실제 환기·냉난방 전력과 비교한다. MILP는 재실행하지 않으므로 이는
+controller 성능 비교가 아니라 **report model 입력 ablation**이다. 결과는
+`saved_model/<data>/<environment>/report_model_input_ablation/<run>/` 아래 case별
+`evaluation.json`, `test_predictions.csv`, 그리고 통합
+`report_model_input_ablation_summary.csv`에 저장된다.
+
+기본 설정에서는 같은 세 입력 case마다 하나의 공통 outcome-blind episode-group
+holdout에서 validation 순위로 후보를 누적해 `previous_7`, `expanded_9`,
+`expanded_10`, `expanded_12`, `expanded_13`, `expanded_17`, `exploratory_41`의
+Top-K prefix를 함께 보고한다. 이는 기존 슬라이드와 동일하게 **총전력** `Pooled
+MAPE`, coverage, worst action, action pass, 판정을 보고하고, 같은 고정 report
+model의 환기·냉난방 component Pooled MAPE를 함께 기록한다. report-model family와
+candidate 순위는 validation만으로 고정되고 test 전력은 선택에 쓰이지 않는다. 단,
+validation이 선택한 K 하나만 공식 selected-K이고 나머지는 sensitivity-only다.
+`previous_7`은 과거 run 재현이 아니라 이번 input-ablation의 validation-ranked
+Top-7이라는 표시명이다. 결과는
+`candidate_pool_expansion_summary.csv`, `candidate_pool_expansion_report.md`,
+`expanded_candidate_pool/<입력 case>/`에 저장된다. 총전력 판정과
+component MAPE를 같은 KPI로 혼동하지 않는다. `metric_targets`에서 총전력,
+기본 component, 전력별 component MAPE 목표를 각각 설정할 수 있고, 표에는
+`환기 판정`, `냉난방 판정`, `총전력 판정`을 독립적으로 기록한다.
 
 공식 대표값은 하나로 고정한 action의 **총 공조유효전력 직접 행 평균 MAPE**입니다.
 분모가 `mape_min_actual_power_w` 이하인 행은 제외하며, exact-match 수, 독립 episode
@@ -231,6 +535,54 @@ MAPE(%) = 100 / n × sum(|actual - predicted| / |actual|)
 평가 전용 분할입니다. 미래 시점 일반화 성능을 주장하지 않으며, action을 실제 장비에
 무작위 배정한 실험도 아니므로 선택 action의 인과적 절감 효과나 실제 최적성을 증명하지
 않습니다. 미래 일반화와 정책 거동은 아래 chronological 평가를 별도로 확인해야 합니다.
+
+### MPC 선택 action 기반 counterfactual report MAPE
+
+`mpc_counterfactual_total_power_report`는 기록 test의 현재 state·외란을 유지한 채,
+각 행마다 MILP가 새 first action을 선택하도록 한 평가다. report model은 시간순
+train으로 family를 학습하고 validation으로 하나를 선택한 뒤 train+validation으로
+재학습하여 test 전에 고정한다.
+
+```text
+recorded x_t, d_t → MILP first action z_t^MPC
+                  ├→ frozen report model(x_t, z_t^recorded, d_t) = ŷ_t^recorded
+                  └→ frozen report model(x_t, z_t^MPC, d_t)      = ŷ_t^MPC
+```
+
+두 MAPE를 함께 저장한다.
+
+```text
+MPC action vs recorded actual MAPE(%)
+= 100 / n × sum(|ŷ_t^MPC - y_t^recorded| / |y_t^recorded|)
+
+MPC action vs recorded-action report MAPE(%)
+= 100 / n × sum(|ŷ_t^MPC - ŷ_t^recorded| / |ŷ_t^recorded|)
+```
+
+두 번째 값은 state·외란·report model을 고정하고 action만 바꾼 모델 기반 상대 차이다.
+따라서 실제-Y forecast accuracy가 아니라 MPC action-effect 진단값이다. 두 baseline에
+대한 예상 절감량도 함께 저장한다. 이 두 MAPE와 예상 절감량은 총전력뿐 아니라
+환기유효전력·냉난방유효전력 각각에 대해서도 산출한다.
+
+```text
+recorded_actual_difference = y^recorded - ŷ^MPC
+report_to_report_predicted_reduction = ŷ^recorded - ŷ^MPC
+```
+
+기본값은 일반 MPC policy와 동일하게 선택된 60분 test window의 모든 유효 transition을
+사용한다. `row_stride_steps`, `maximum_evaluation_rows`로 실행량을 제한할 수 있다.
+행별 기록은 `mpc_counterfactual_total_power_report_predictions.csv`, 요약은
+`mpc_counterfactual_total_power_report_evaluation.json` 및
+`mpc_evaluation.json.mpc_counterfactual_total_power_report_evaluation`에 저장된다.
+행별 CSV에는 `recorded_actual_<전력명>`,
+`recorded_action_report_predicted_<전력명>`,
+`mpc_action_report_predicted_<전력명>` 열이 포함된다.
+
+첫 번째 MAPE는 변경 action의 실제 전력이 없으므로 일반적인 동일-treatment 실제-Y
+forecast MAPE와 다르며, 예상 제어 효과와 report model 오차가 함께 들어간다. 두 번째
+MAPE·예상 절감률은 실제 Y를 쓰지 않으므로 실제 장비 절감률로 주장할 수 없다. action
+변경률, 두 MAPE의 유효 coverage, report model의 별도 observed-action MAPE를 함께
+보고해야 한다.
 
 ### 보조 MPC-selected-action rolling cross-fit MAPE
 
@@ -338,7 +690,7 @@ src/
 │   ├── mixed_integer_mpc.py      # SciPy/HiGHS MILP
 │   ├── action_crossfit.py        # MPC 선택 조합 rolling cross-fit 실제-Y MAPE
 │   ├── fixed_action_evaluation.py # 공식 단일 조합 grouped holdout 실제-Y MAPE
-│   ├── fixed_action_power_models.py # 평가전용 direct total-power 모델 선택
+│   ├── fixed_action_power_models.py # 평가전용 component-aware total-power 모델 선택
 │   ├── evaluation.py             # recursive/closed-loop KPI와 bootstrap
 │   └── pipeline.py               # 학습·검증·정책 평가·artifact 저장
 ├── dynamics/

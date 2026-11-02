@@ -25,6 +25,10 @@ def create_dataloader(
                 categorical_feature: list,
                 cat_encode_method: str,
                 numerical_feature: list,
+                data_versions = None,
+                merge_strategy: str = 'segmented_concat',
+                prevent_cross_segment_windows: bool = True,
+                segment_split: str = 'global',
                 del_feature: list = None,
                 split_rate: list = [0.7, 0.1, 0.2],
                 seq_len: int = 96,
@@ -49,6 +53,10 @@ def create_dataloader(
                             target_features         = target_features,
                             del_feature             = del_feature,
                             data_version            = data_version,
+                            data_versions           = data_versions,
+                            merge_strategy          = merge_strategy,
+                            prevent_cross_segment_windows = prevent_cross_segment_windows,
+                            segment_split           = segment_split,
                             split_rate              = split_rate,
                             split_date              = split_date,
                             end_date                = end_date,
@@ -66,7 +74,9 @@ def create_dataloader(
                             input_features       = input_features,
                             categorical_feature  = all_categorical_feature,
                             numerical_feature    = numerical_feature,
-                            feature_indices      = scaler_dict.get('feature_indices')
+                            feature_indices      = scaler_dict.get('feature_indices'),
+                            segment_ids          = data_dict['train'].get('segment_ids'),
+                            prevent_cross_segment_windows = prevent_cross_segment_windows,
                             )
     
     val_dataset = HVACDataset(data               = data_dict['val']['data'],
@@ -79,7 +89,9 @@ def create_dataloader(
                             input_features       = input_features,
                             categorical_feature  = all_categorical_feature,
                             numerical_feature    = numerical_feature,
-                            feature_indices      = scaler_dict.get('feature_indices')
+                            feature_indices      = scaler_dict.get('feature_indices'),
+                            segment_ids          = data_dict['val'].get('segment_ids'),
+                            prevent_cross_segment_windows = prevent_cross_segment_windows,
                             )
     
     tst_dataset = HVACDataset(data               = data_dict['test']['data'],
@@ -92,7 +104,9 @@ def create_dataloader(
                             input_features       = input_features,
                             categorical_feature  = all_categorical_feature,
                             numerical_feature    = numerical_feature,
-                            feature_indices      = scaler_dict.get('feature_indices')
+                            feature_indices      = scaler_dict.get('feature_indices'),
+                            segment_ids          = data_dict['test'].get('segment_ids'),
+                            prevent_cross_segment_windows = prevent_cross_segment_windows,
                             )
     
     # torch dataloader
@@ -141,6 +155,15 @@ def create_dataloader(
         "model_name": model_name,
         "environment_name": environment_name,
         "data_version": data_version,
+        "data_versions": scaler_dict.get('data_versions', [data_version]),
+        "data_version_label": scaler_dict.get('data_version_label', data_version),
+        "merge_strategy": scaler_dict.get('merge_strategy', merge_strategy),
+        "prevent_cross_segment_windows": bool(prevent_cross_segment_windows),
+        "n_samples_by_split": {
+            "train": len(trn_dataset),
+            "val": len(val_dataset),
+            "test": len(tst_dataset),
+        },
     }
 
     return trn_dataloader, val_dataloader, tst_dataloader, metadata, scaler_dict

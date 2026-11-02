@@ -14,11 +14,311 @@ from dynamics.evaluator_base import history_for_rollout, start_rollout_session
 
 LOGGER = logging.getLogger('MPC.evaluation')
 
+REPORT_MODEL_REFIT_SCOPES = ('train_validation', 'train_validation_test')
+
+
+def resolve_report_model_refit_rows(
+    data,
+    training_rows,
+    validation_rows,
+    *,
+    test_rows=None,
+    scope: str = 'train_validation',
+) -> np.ndarray:
+    """frozen report model을 다시 학습할 행 집합을 refit scope 설정에 따라 만든다.
+
+    - ``train_validation`` (기본): train + validation 만 사용하고 test는 채점 전용으로
+      남긴다(=held-out test 오차 추정). 지금까지의 동작과 동일하다.
+    - ``train_validation_test``: 배포용 instrument 목적으로 test까지 포함해 학습한다.
+      **이 경우 test 실제값으로 학습하므로, 그 뒤 test에서 잰 MAPE/WAPE는 held-out
+      오차가 아니라 누수된 값**이 된다. KPI(일반화 성능) 주장에는 쓸 수 없다.
+    """
+    scope = str(scope)
+    if scope not in REPORT_MODEL_REFIT_SCOPES:
+        raise ValueError(
+            f'report_model_refit_scope must be one of {REPORT_MODEL_REFIT_SCOPES}; '
+            f'got {scope!r}'
+        )
+    parts = [
+        data.valid_transition_rows(training_rows),
+        data.valid_transition_rows(validation_rows),
+    ]
+    if scope == 'train_validation_test':
+        if test_rows is None:
+            raise ValueError(
+                "report_model_refit_scope='train_validation_test' requires test_rows"
+            )
+        parts.append(data.valid_transition_rows(test_rows))
+    return np.unique(np.concatenate(parts))
+
 
 @dataclass(frozen=True)
 class PlantRollout:
     states: np.ndarray
     powers: np.ndarray
+
+
+@dataclass(frozen=True)
+class GatedMPCSolveResult:
+    """First-action solve outcome with a train-only eligibility audit.
+
+    ``solution`` is ``None`` only when the candidate gate leaves no action.
+    In that case the caller must hold the previous applied action rather than
+    inventing a test-recorded action as a fallback.
+    """
+
+    solution: object | None
+    applied_control: np.ndarray
+    has_incumbent: bool
+    used_fallback: bool
+    fallback_reason: str | None
+    retry_count: int
+    candidate_decisions: tuple[object, ...]
+    selected_decision: object | None
+
+    def summary(self) -> Dict[str, object]:
+        candidates = self.candidate_decisions
+        trust_rejected = 0
+        model_rejected = 0
+        report_action_effect_rejected = 0
+        state_safety_relaxed = False
+        for decision in candidates:
+            screen = getattr(decision, 'model_screen', None)
+            if screen is not None and 'state_safety_relaxed_non_worsening' in tuple(
+                getattr(screen, 'notes', ())
+            ):
+                state_safety_relaxed = True
+            reasons = tuple(getattr(decision, 'rejection_reasons', ()))
+            trust = getattr(decision, 'trust', None)
+            if trust is not None and not bool(getattr(trust, 'eligible', False)):
+                trust_rejected += 1
+            if any(
+                reason.startswith('affine_evaluator_')
+                or reason.startswith('evaluator_state_')
+                or reason.startswith('independent_model_')
+                for reason in reasons
+            ):
+                model_rejected += 1
+            if any(
+                reason.startswith('report_total_action_effect_')
+                or reason.startswith('report_component_action_effect_')
+                or reason.startswith('report_action_effect_')
+                for reason in reasons
+            ):
+                report_action_effect_rejected += 1
+        return {
+            'candidate_count': int(len(candidates)),
+            'eligible_candidate_count': int(
+                sum(bool(getattr(item, 'eligible', False)) for item in candidates)
+            ),
+            'trust_rejected_candidate_count': int(trust_rejected),
+            'model_rejected_candidate_count': int(model_rejected),
+            'report_action_effect_rejected_candidate_count': int(
+                report_action_effect_rejected
+            ),
+            'used_action_gate_fallback': bool(self.used_fallback),
+            'action_gate_fallback_reason': self.fallback_reason,
+            'action_gate_retry_count': int(self.retry_count),
+            'state_safety_relaxed_non_worsening': bool(state_safety_relaxed),
+        }
+
+
+def solve_first_action_with_gate(
+    controller,
+    *,
+    initial_state: np.ndarray,
+    disturbances: np.ndarray,
+    previous_control: np.ndarray,
+    evaluator,
+    action_gate=None,
+    action_history: np.ndarray | None = None,
+    maximum_retries: int = 1,
+) -> GatedMPCSolveResult:
+    """Solve one MPC step after optional local-support/model screening.
+
+    The dynamic exclusions apply only to ``z_0``.  Later actions in the 60
+    minute plan are provisional; at the next real minute a measured state is
+    available and this function builds a fresh first-action screen again.
+    """
+    previous_control = np.asarray(previous_control, dtype=float).copy()
+    retries = int(maximum_retries)
+    if retries < 0:
+        raise ValueError('maximum_retries must be non-negative')
+    if action_gate is None:
+        solve_kwargs = {
+            'initial_state': initial_state,
+            'disturbances': disturbances,
+            'previous_control': previous_control,
+        }
+        if action_history is not None:
+            solve_kwargs['action_history'] = action_history
+        solution = controller.solve(
+            **solve_kwargs,
+        )
+        has_incumbent = bool(len(solution.control_vectors))
+        return GatedMPCSolveResult(
+            solution=solution,
+            applied_control=(
+                solution.control_vectors[0].copy()
+                if has_incumbent
+                else previous_control
+            ),
+            has_incumbent=has_incumbent,
+            used_fallback=not has_incumbent,
+            fallback_reason=(None if has_incumbent else 'solver_no_incumbent'),
+            retry_count=0,
+            candidate_decisions=(),
+            selected_decision=None,
+        )
+
+    gate_kwargs = {'evaluator': evaluator}
+    # Preserve the lightweight gate protocol used by diagnostic tests and
+    # external callers.  Only the concrete report-action-effect extension
+    # needs an explicit reference action.
+    if (
+        getattr(action_gate, 'report_action_effect_gate', None) is not None
+        or getattr(action_gate, 'requires_reference_control', False)
+    ):
+        gate_kwargs['reference_control'] = previous_control
+    allowed, decisions = action_gate.evaluate(
+        initial_state,
+        np.asarray(disturbances, dtype=float)[0],
+        **gate_kwargs,
+    )
+    decisions = tuple(decisions)
+    if not len(allowed):
+        return GatedMPCSolveResult(
+            solution=None,
+            applied_control=previous_control,
+            has_incumbent=False,
+            used_fallback=True,
+            fallback_reason='no_trusted_first_action',
+            retry_count=0,
+            candidate_decisions=decisions,
+            selected_decision=None,
+        )
+
+    def control_key(vector) -> tuple[int, ...]:
+        return tuple(
+            np.rint(np.asarray(vector, dtype=float)).astype(int).tolist()
+        )
+
+    # The gate is a *candidate-pool restriction*, not merely a way to reject
+    # the candidates it happens to inspect.  Without these first-step cuts a
+    # controller with a broader static domain could select an action absent
+    # from the gate pool and escape the trust/screen policy.  Static forbidden
+    # actions are already handled for every planned step by the controller;
+    # only otherwise-valid first actions need to be added here.
+    eligible_keys = {control_key(vector) for vector in np.asarray(allowed, dtype=float)}
+    static_forbidden_keys = {
+        control_key(vector)
+        for vector in np.asarray(controller.forbidden_control_vectors, dtype=float)
+    }
+    forbidden_by_key = {
+        control_key(decision.encoded_control): np.asarray(
+            decision.encoded_control,
+            dtype=float,
+        )
+        for decision in decisions
+        if (
+            decision.encoded_control is not None
+            and not bool(decision.eligible)
+        )
+    }
+    for vector in controller.encoder.valid_control_vectors(controller.logical_rules):
+        key = control_key(vector)
+        if key not in eligible_keys and key not in static_forbidden_keys:
+            forbidden_by_key.setdefault(key, np.asarray(vector, dtype=float))
+    forbidden = list(forbidden_by_key.values())
+    decision_by_key = {
+        control_key(decision.encoded_control): decision
+        for decision in decisions
+        if decision.encoded_control is not None
+    }
+    for retry in range(retries + 1):
+        forbidden_matrix = (
+            np.asarray(forbidden, dtype=float)
+            if forbidden
+            else np.empty((0, previous_control.size), dtype=float)
+        )
+        solve_kwargs = {
+            'initial_state': initial_state,
+            'disturbances': disturbances,
+            'previous_control': previous_control,
+            'first_step_forbidden_control_vectors': forbidden_matrix,
+        }
+        if action_history is not None:
+            solve_kwargs['action_history'] = action_history
+        solution = controller.solve(
+            **solve_kwargs,
+        )
+        has_incumbent = bool(len(solution.control_vectors))
+        if not has_incumbent:
+            return GatedMPCSolveResult(
+                solution=solution,
+                applied_control=previous_control,
+                has_incumbent=False,
+                used_fallback=True,
+                fallback_reason='solver_no_incumbent_after_action_gate',
+                retry_count=retry,
+                candidate_decisions=decisions,
+                selected_decision=None,
+            )
+        selected = solution.control_vectors[0].copy()
+        selected_decision = decision_by_key.get(control_key(selected))
+        if selected_decision is not None and bool(selected_decision.eligible):
+            return GatedMPCSolveResult(
+                solution=solution,
+                applied_control=selected,
+                has_incumbent=True,
+                used_fallback=False,
+                fallback_reason=None,
+                retry_count=retry,
+                candidate_decisions=decisions,
+                selected_decision=selected_decision,
+            )
+        # Defensive retry: a caller can configure a controller whose static
+        # candidate set is wider than the gate candidate set.  Never apply the
+        # escaped action; add a no-good cut and resolve once more.
+        forbidden_by_key.setdefault(control_key(selected), selected)
+        forbidden = list(forbidden_by_key.values())
+    return GatedMPCSolveResult(
+        solution=None,
+        applied_control=previous_control,
+        has_incumbent=False,
+        used_fallback=True,
+        fallback_reason='selected_action_failed_gate_after_retry',
+        retry_count=retries,
+        candidate_decisions=decisions,
+        selected_decision=None,
+    )
+
+
+def recorded_action_history(
+    data,
+    end_exclusive: int,
+    lookback_steps: int,
+) -> np.ndarray:
+    """Return recent recorded controls without crossing a source segment.
+
+    This function is only a bootstrap for the first control decision of a
+    closed-loop window or for a row-wise counterfactual diagnostic. Once the
+    policy starts, ``run_receding_horizon_policy`` appends its own applied MPC
+    actions instead of continuing to read recorded future actions.
+    """
+    end_exclusive = int(end_exclusive)
+    lookback_steps = int(lookback_steps)
+    if lookback_steps <= 0 or end_exclusive <= 0:
+        return np.empty((0, data.encoder.n_features), dtype=float)
+    if end_exclusive > len(data.controls):
+        raise IndexError('end_exclusive exceeds available control rows')
+    start = max(0, end_exclusive - lookback_steps)
+    if data.segment_ids is not None:
+        segment_ids = np.asarray(data.segment_ids)
+        segment = segment_ids[end_exclusive - 1]
+        while start < end_exclusive and segment_ids[start] != segment:
+            start += 1
+    return np.asarray(data.controls[start:end_exclusive], dtype=float).copy()
 
 
 class AffinePlantAdapter:
@@ -882,6 +1182,122 @@ def controller_disturbance_forecast(
     )
 
 
+def action_gate_candidate_audit_rows(
+    decisions,
+    *,
+    data,
+    timestamp,
+    source_row_index: int | None,
+    policy_step: int | None,
+    evaluation_path: str,
+    applied_control: np.ndarray | None = None,
+    has_incumbent: bool | None = None,
+    fallback_reason: str | None = None,
+) -> list[Dict[str, object]]:
+    """Flatten action-gate decisions into a durable candidate-level audit.
+
+    ``applied_control`` is recorded on every candidate row because the final
+    applied action can be a hold-previous-action fallback rather than a MILP
+    incumbent.  Keeping those two facts separate prevents downstream analysis
+    from falsely describing a fallback as an MPC-selected action.
+    """
+    applied_key = (
+        None
+        if applied_control is None
+        else tuple(np.rint(np.asarray(applied_control, dtype=float)).astype(int))
+    )
+    rows = []
+    for decision in decisions:
+        trust = getattr(decision, 'trust', None)
+        screen = getattr(decision, 'model_screen', None)
+        report_action_effect = getattr(decision, 'report_action_effect', None)
+        record: Dict[str, object] = {
+            'evaluation_path': str(evaluation_path),
+            'source_row_index': source_row_index,
+            'policy_step': policy_step,
+            'timestamp': str(timestamp),
+            'encoded_control': list(getattr(decision, 'encoded_control', ())),
+            'eligible': bool(getattr(decision, 'eligible', False)),
+            'rejection_reasons': list(getattr(decision, 'rejection_reasons', ())),
+            'applied_encoded_control': (
+                None if applied_key is None else list(applied_key)
+            ),
+            'selected_by_milp': bool(
+                has_incumbent
+                and applied_key is not None
+                and tuple(getattr(decision, 'encoded_control', ())) == applied_key
+            ),
+            'used_action_gate_fallback': bool(
+                fallback_reason is not None and not bool(has_incumbent)
+            ),
+            'action_gate_fallback_reason': fallback_reason,
+        }
+        if trust is not None:
+            action = getattr(trust, 'action', None) or {}
+            record.update({f'action_{name}': value for name, value in action.items()})
+            global_support = getattr(trust, 'global_support', {}) or {}
+            local_support = getattr(trust, 'local_support', {}) or {}
+            record.update({f'global_{name}': value for name, value in global_support.items()})
+            record.update({f'local_{name}': value for name, value in local_support.items()})
+            record['trust_rejection_reasons'] = list(
+                getattr(trust, 'rejection_reasons', ())
+            )
+        if screen is not None:
+            record['model_screen_rejection_reasons'] = list(
+                getattr(screen, 'rejection_reasons', ())
+            )
+            record['maximum_normalized_component_disagreement'] = getattr(
+                screen,
+                'maximum_normalized_component_disagreement',
+                None,
+            )
+            affine_power = getattr(screen, 'affine_power_components_w', None)
+            evaluator_power = getattr(screen, 'evaluator_power_components_w', None)
+            disagreement = getattr(screen, 'normalized_component_disagreement', None)
+            if affine_power is not None:
+                for position, value in enumerate(affine_power):
+                    record[f'affine_{data.power_names[position]}'] = value
+            if evaluator_power is not None:
+                for position, value in enumerate(evaluator_power):
+                    record[f'evaluator_{data.power_names[position]}'] = value
+            if disagreement is not None:
+                for position, value in enumerate(disagreement):
+                    record[f'normalized_disagreement_{data.power_names[position]}'] = value
+            record['evaluator_state_safety'] = getattr(screen, 'state_safety', None)
+        if report_action_effect is not None:
+            record['report_action_effect_rejection_reasons'] = list(
+                getattr(report_action_effect, 'rejection_reasons', ())
+            )
+            record['report_reference_total_power_w'] = getattr(
+                report_action_effect,
+                'reference_total_power_w',
+                None,
+            )
+            record['report_candidate_total_power_w'] = getattr(
+                report_action_effect,
+                'candidate_total_power_w',
+                None,
+            )
+            record['report_total_relative_change_percent'] = getattr(
+                report_action_effect,
+                'total_relative_change_percent',
+                None,
+            )
+            component_change = getattr(
+                report_action_effect,
+                'component_relative_change_percent',
+                None,
+            )
+            if component_change is not None:
+                for position, value in enumerate(component_change):
+                    record[
+                        'report_component_relative_change_percent_'
+                        f'{data.power_names[position]}'
+                    ] = value
+        rows.append(record)
+    return rows
+
+
 def run_receding_horizon_policy(
     controller,
     evaluator,
@@ -891,6 +1307,7 @@ def run_receding_horizon_policy(
     disturbance_forecast_method: str,
     training_control_support: np.ndarray,
     *,
+    action_gate=None,
     progress_prefix: str = '',
     progress_interval: int = 10,
 ) -> Dict[str, object]:
@@ -907,11 +1324,33 @@ def run_receding_horizon_policy(
         if start > 0
         else data.encoder.encode_action()
     )
+    begin_window = getattr(controller, 'begin_window', None)
+    if begin_window is not None:
+        begin_window(data, start)
+    action_history_enabled = bool(
+        getattr(controller, 'action_history_enabled', False)
+    )
+    action_history_lookback = int(
+        getattr(controller, 'action_history_lookback_steps', 0)
+    )
+    action_history = (
+        [
+            vector.copy()
+            for vector in recorded_action_history(
+                data,
+                start,
+                action_history_lookback,
+            )
+        ]
+        if action_history_enabled
+        else None
+    )
     support = {
         tuple(np.rint(vector).astype(int).tolist())
         for vector in np.asarray(training_control_support)
     }
     step_records = []
+    candidate_diagnostic_rows = []
     evaluator_session = start_rollout_session(
         evaluator,
         history_for_rollout(
@@ -922,7 +1361,13 @@ def run_receding_horizon_policy(
     )
 
     for step in range(duration_steps):
+        step_started = perf_counter()
         data_index = start + step
+        history_before_action = (
+            np.asarray(action_history, dtype=float)
+            if action_history is not None
+            else None
+        )
         forecast = controller_disturbance_forecast(
             data,
             data_index,
@@ -930,18 +1375,42 @@ def run_receding_horizon_policy(
             disturbance_forecast_method,
         )
         solve_started = perf_counter()
-        solution = controller.solve(
+        gated_solve = solve_first_action_with_gate(
+            controller,
             initial_state=states[step],
             disturbances=forecast,
             previous_control=previous_control,
+            evaluator=evaluator,
+            action_gate=action_gate,
+            action_history=history_before_action,
         )
         solve_seconds = perf_counter() - solve_started
-        has_incumbent = len(solution.control_vectors) > 0
-        used_fallback = not has_incumbent
-        applied_control = (
-            solution.control_vectors[0].copy()
-            if has_incumbent
-            else previous_control.copy()
+        solution = gated_solve.solution
+        has_incumbent = bool(gated_solve.has_incumbent)
+        used_fallback = bool(gated_solve.used_fallback)
+        applied_control = gated_solve.applied_control.copy()
+        gate_summary = gated_solve.summary()
+        history_diagnostics = (
+            controller.action_history_diagnostics(
+                applied_control,
+                history_before_action,
+                previous_control=previous_control,
+            )
+            if action_history_enabled
+            else {'enabled': False}
+        )
+        candidate_diagnostic_rows.extend(
+            action_gate_candidate_audit_rows(
+                gated_solve.candidate_decisions,
+                data=data,
+                timestamp=data.timestamps.iloc[data_index].isoformat(),
+                source_row_index=int(data_index),
+                policy_step=int(step + 1),
+                evaluation_path='closed_loop_mpc',
+                applied_control=applied_control,
+                has_incumbent=has_incumbent,
+                fallback_reason=gated_solve.fallback_reason,
+            )
         )
         controls[step] = applied_control
         actual_disturbance = data.disturbances[data_index]
@@ -956,6 +1425,9 @@ def run_receding_horizon_policy(
             actual_disturbance,
             timestamp=data.timestamps.iloc[data_index],
         )
+        observe_step = getattr(controller, 'observe_step', None)
+        if observe_step is not None:
+            observe_step(states[step], applied_control, states[step + 1])
         rounded_control = tuple(np.rint(applied_control).astype(int).tolist())
         is_ood = rounded_control not in support
         action = data.encoder.decode_action(applied_control)
@@ -966,15 +1438,46 @@ def run_receding_horizon_policy(
         record = {
             'timestamp': data.timestamps.iloc[data_index].isoformat(),
             'step': int(step + 1),
-            'solver_success': bool(solution.success),
-            'solver_status': int(solution.status),
-            'solver_message': solution.message,
+            'solver_success': bool(solution.success) if solution is not None else False,
+            'solver_status': int(solution.status) if solution is not None else None,
+            'solver_message': (
+                solution.message
+                if solution is not None
+                else str(gated_solve.fallback_reason)
+            ),
             'has_incumbent': bool(has_incumbent),
             'used_fallback': bool(used_fallback),
             'solve_seconds': float(solve_seconds),
-            'objective': float(solution.objective) if has_incumbent else None,
+            'objective': (
+                float(solution.objective)
+                if has_incumbent and solution is not None
+                else None
+            ),
             'control_switched': bool(switched),
             'training_support_ood': bool(is_ood),
+            'action_history_enabled': bool(history_diagnostics['enabled']),
+            'action_history_lookback_steps_used': int(
+                history_diagnostics.get('lookback_steps_used', 0)
+            ),
+            'action_history_weighted_distance': history_diagnostics.get(
+                'weighted_distance'
+            ),
+            'action_history_historical_change_count': history_diagnostics.get(
+                'historical_change_count'
+            ),
+            'action_history_current_change_count': history_diagnostics.get(
+                'current_change_count'
+            ),
+            'action_history_rolling_change_count': history_diagnostics.get(
+                'rolling_change_count'
+            ),
+            'action_history_rolling_change_budget': history_diagnostics.get(
+                'rolling_change_budget'
+            ),
+            'action_history_rolling_budget_overflow': history_diagnostics.get(
+                'rolling_budget_overflow'
+            ),
+            **gate_summary,
             **{f'action_{name}': value for name, value in action.items()},
             **{
                 f'state_{name}': float(states[step, position])
@@ -985,10 +1488,18 @@ def run_receding_horizon_policy(
                 for position, name in enumerate(data.disturbance_names)
             },
         }
+        record.update({
+            f'action_history_distance_{lag}': value
+            for lag, value in history_diagnostics.get('distance_by_lag', {}).items()
+        })
         for position, name in enumerate(data.power_names):
             record[f'evaluator_{name}'] = float(powers[step, position])
             record[f'affine_{name}'] = float(affine_power[step, position])
+        record['end_to_end_step_seconds'] = float(perf_counter() - step_started)
         step_records.append(record)
+        if action_history is not None:
+            action_history.append(applied_control.copy())
+            del action_history[:-action_history_lookback]
         previous_control = applied_control
 
         if progress_prefix and (
@@ -997,12 +1508,16 @@ def run_receding_horizon_policy(
             or (step + 1) % max(1, int(progress_interval)) == 0
         ):
             LOGGER.info(
-                '%s: closed-loop step %d/%d | solve_seconds=%.6f | fallback=%s',
+                '%s: closed-loop step %d/%d | solve_seconds=%.6f | '
+                'candidates=%d | eligible=%d | fallback=%s | reason=%s',
                 progress_prefix,
                 step + 1,
                 duration_steps,
                 solve_seconds,
+                int(gate_summary['candidate_count']),
+                int(gate_summary['eligible_candidate_count']),
                 used_fallback,
+                gated_solve.fallback_reason,
             )
 
     return {
@@ -1011,6 +1526,7 @@ def run_receding_horizon_policy(
         'affine_power_predictions': affine_power,
         'controls': controls,
         'step_records': step_records,
+        'candidate_diagnostic_rows': candidate_diagnostic_rows,
         'first_action': data.encoder.decode_action(controls[0]),
     }
 
@@ -1024,6 +1540,43 @@ def solver_metrics(
         dtype=float,
     )
     solve_count = int(len(step_records))
+    candidate_counts = np.asarray(
+        [float(record.get('candidate_count', 0)) for record in step_records],
+        dtype=float,
+    )
+    eligible_candidate_counts = np.asarray(
+        [
+            float(record.get('eligible_candidate_count', 0))
+            for record in step_records
+        ],
+        dtype=float,
+    )
+    fallback_reasons: Dict[str, int] = {}
+    for record in step_records:
+        reason = record.get('action_gate_fallback_reason')
+        if reason:
+            fallback_reasons[str(reason)] = (
+                fallback_reasons.get(str(reason), 0) + 1
+            )
+    history_enabled = any(
+        bool(record.get('action_history_enabled', False))
+        for record in step_records
+    )
+    history_weighted_distances = np.asarray([
+        float(record['action_history_weighted_distance'])
+        for record in step_records
+        if record.get('action_history_weighted_distance') is not None
+    ], dtype=float)
+    history_rolling_counts = np.asarray([
+        float(record['action_history_rolling_change_count'])
+        for record in step_records
+        if record.get('action_history_rolling_change_count') is not None
+    ], dtype=float)
+    history_budget_overflows = np.asarray([
+        float(record['action_history_rolling_budget_overflow'])
+        for record in step_records
+        if record.get('action_history_rolling_budget_overflow') is not None
+    ], dtype=float)
     return {
         'solve_count': solve_count,
         'optimal_success_count': int(
@@ -1041,6 +1594,60 @@ def solver_metrics(
         'control_switch_count': int(
             sum(bool(record['control_switched']) for record in step_records)
         ),
+        'action_gate': {
+            'candidate_count_per_solve': {
+                'mean': (
+                    float(candidate_counts.mean()) if solve_count else None
+                ),
+                'minimum': (
+                    int(candidate_counts.min()) if solve_count else None
+                ),
+                'maximum': (
+                    int(candidate_counts.max()) if solve_count else None
+                ),
+            },
+            'eligible_candidate_count_per_solve': {
+                'mean': (
+                    float(eligible_candidate_counts.mean())
+                    if solve_count
+                    else None
+                ),
+                'minimum': (
+                    int(eligible_candidate_counts.min()) if solve_count else None
+                ),
+                'maximum': (
+                    int(eligible_candidate_counts.max()) if solve_count else None
+                ),
+            },
+            'fallback_count': int(
+                sum(
+                    bool(record.get('used_action_gate_fallback', False))
+                    for record in step_records
+                )
+            ),
+            'fallback_reasons': fallback_reasons,
+        },
+        'action_history': {
+            'enabled': bool(history_enabled),
+            'mean_weighted_distance': (
+                float(history_weighted_distances.mean())
+                if len(history_weighted_distances)
+                else None
+            ),
+            'mean_rolling_change_count': (
+                float(history_rolling_counts.mean())
+                if len(history_rolling_counts)
+                else None
+            ),
+            'rolling_budget_overflow_step_count': int(
+                (history_budget_overflows > 1e-12).sum()
+            ),
+            'maximum_rolling_budget_overflow': (
+                float(history_budget_overflows.max())
+                if len(history_budget_overflows)
+                else None
+            ),
+        },
         'deadline_seconds': float(deadline_seconds),
         'deadline_miss_count': int(np.count_nonzero(solve_seconds > deadline_seconds)),
         'solve_seconds': {

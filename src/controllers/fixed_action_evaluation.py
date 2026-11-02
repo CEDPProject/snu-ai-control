@@ -477,6 +477,7 @@ def evaluate_fixed_optimal_action_holdout(
     selection_preference=None,
     total_power_random_state: int = 0,
     target_mape_percent: float = 1.95,
+    report_model_refit_scope: str = 'train_validation',
 ) -> tuple[Dict[str, object], list[Dict[str, object]]]:
     """Select one action on validation predictions, freeze it, and test MAPE."""
     minimum_satisfaction = float(minimum_predicted_state_satisfaction_percent)
@@ -686,7 +687,7 @@ def evaluate_fixed_optimal_action_holdout(
         },
         'state_and_component_report_model': frozen_report_evaluator_name,
         'total_power_report_model': (
-            'validation-selected direct total-power model'
+            'validation-selected component-aware total-power model'
             if total_power_report_enabled
             else frozen_report_evaluator_name
         ),
@@ -796,6 +797,8 @@ def evaluate_fixed_optimal_action_holdout(
             config=total_power_specification,
             mape_min_actual_power_w=float(mape_min_actual_power_w),
             random_state=int(total_power_random_state),
+            test_rows=holdout.test_rows,
+            refit_scope=report_model_refit_scope,
         )
         protocol['total_power_report_model'] = (
             total_power_model_selection.selected_family
@@ -814,7 +817,7 @@ def evaluate_fixed_optimal_action_holdout(
         selected_control,
     )
     evaluated_rows = np.asarray(predictions.row_indices, dtype=int)
-    component_metrics = power_prediction_metrics(
+    legacy_component_metrics = power_prediction_metrics(
         predictions.actual_powers,
         predictions.predicted_powers,
         data.power_names,
@@ -833,16 +836,24 @@ def evaluate_fixed_optimal_action_holdout(
     )
     if total_power_model_selection is None:
         predicted_total = legacy_predicted_total
+        predicted_components = predictions.predicted_powers
         official_total_power_model_family = frozen_report_evaluator_name
     else:
-        predicted_total = total_power_model_selection.model.predict(
+        predicted_components = total_power_model_selection.model.predict_components(
             data.states[evaluated_rows],
             data.controls[evaluated_rows],
             data.disturbances[evaluated_rows],
         )
+        predicted_total = predicted_components.sum(axis=1, keepdims=True)
         official_total_power_model_family = (
             total_power_model_selection.selected_family
         )
+    report_component_metrics = power_prediction_metrics(
+        predictions.actual_powers,
+        predicted_components,
+        data.power_names,
+        mape_min_actual_power_w,
+    )
     total_metrics = power_prediction_metrics(
         actual_total,
         predicted_total,
@@ -892,7 +903,8 @@ def evaluate_fixed_optimal_action_holdout(
         'official_total_power_model_family': official_total_power_model_family,
         'total_power_prediction': total_metrics,
         'legacy_component_sum_total_power_prediction': legacy_total_metrics,
-        'power_component_prediction': component_metrics,
+        'power_component_prediction': report_component_metrics,
+        'legacy_evaluator_component_prediction': legacy_component_metrics,
         'actual_joint_state_constraint_satisfaction_percent': float(
             100.0 * actual_satisfied.mean()
         ),
@@ -915,6 +927,7 @@ def evaluate_fixed_optimal_action_holdout(
                 legacy_total_metrics['mape_percent']
             ),
             'selected_model_test_mape_percent': primary_mape,
+            'selected_model_component_prediction': report_component_metrics,
             'test_targets_used_to_select_family': False,
         }
         if total_power_model_selection is not None
@@ -926,6 +939,7 @@ def evaluate_fixed_optimal_action_holdout(
                 legacy_total_metrics['mape_percent']
             ),
             'selected_model_test_mape_percent': primary_mape,
+            'selected_model_component_prediction': report_component_metrics,
             'test_targets_used_to_select_family': False,
         }
     )
@@ -950,6 +964,12 @@ def evaluate_fixed_optimal_action_holdout(
                 **{
                     f'predicted_{name}': float(
                         predictions.predicted_powers[position, output]
+                    )
+                    for output, name in enumerate(data.power_names)
+                },
+                **{
+                    f'official_report_predicted_{name}': float(
+                        predicted_components[position, output]
                     )
                     for output, name in enumerate(data.power_names)
                 },

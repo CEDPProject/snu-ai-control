@@ -14,7 +14,14 @@ def _fit_physical_ridge(
     targets: np.ndarray,
     alpha: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fit on standardized inputs and return coefficients in physical units."""
+    """Fit output-wise Ridge on standardized inputs in physical units.
+
+    ``Ridge`` accepts a two-dimensional target matrix, but its multi-output
+    objective is separable by target column: each state or power component has
+    its own coefficient row and intercept.  The only shared object is the
+    input scaler, which keeps physical-unit conversion consistent across
+    component equations; there is no cross-meter target coupling.
+    """
     scaler = StandardScaler()
     standardized = scaler.fit_transform(features)
     estimator = Ridge(alpha=float(alpha))
@@ -120,6 +127,11 @@ class AffinePowerModel:
     def to_dict(self) -> Dict:
         return {
             'equation': 'power_components = F @ x + G @ z + H @ d + b',
+            'component_modeling': (
+                'One independent affine Ridge equation per named power meter; '
+                'components share input scaling only and are summed after '
+                'nonnegative clipping for the MILP objective.'
+            ),
             'F': self.F.tolist(),
             'G': self.G.tolist(),
             'H': self.H.tolist(),

@@ -10,6 +10,9 @@ from dynamics.neural_evaluators import (
     ForecastingSequenceEvaluator,
     NeuralResidualEvaluator,
 )
+from dynamics.component_power_evaluator import (
+    ComponentSeparatedTwoStageHVACEvaluator,
+)
 from dynamics.nonlinear import IndependentTreeEvaluator
 from dynamics.sklearn_evaluators import IndependentSklearnEvaluator
 
@@ -19,6 +22,8 @@ SKLEARN_FAMILIES = {
     'random_forest_residual_state',
     'hist_gradient_boosting_residual_state',
 }
+
+COMPONENT_POWER_FAMILIES = {'component_two_stage_hvac'}
 
 
 def _mapping(value) -> dict:
@@ -52,6 +57,7 @@ def available_evaluator_families(model_setting_path: Optional[str] = None):
     forecasting_models = tuple(_model_settings(model_setting_path).keys())
     return {
         'sklearn': sorted(SKLEARN_FAMILIES),
+        'component_power': sorted(COMPONENT_POWER_FAMILIES),
         'neural_residual': ['neural_residual'],
         'forecasting_sequence': list(forecasting_models),
         'forecasting_selector_examples': [
@@ -106,6 +112,28 @@ def create_independent_evaluator(
             max_features=float(evaluator_cfg.max_features),
             n_jobs=int(evaluator_cfg.n_jobs),
             random_state=int(random_state),
+        )
+
+    if family == 'component_two_stage_hvac':
+        # Keep the component-specific setting isolated from the common tree
+        # hyperparameters.  The top-level fallback makes an early experiment
+        # config using ``hvac_active_threshold_w`` continue to work while the
+        # documented configuration lives under ``component_power``.
+        component_power = _section(evaluator_cfg, 'component_power')
+        hvac_active_threshold_w = component_power.get(
+            'hvac_active_threshold_w',
+            evaluator_cfg.get('hvac_active_threshold_w', 0.1),
+        )
+        return ComponentSeparatedTwoStageHVACEvaluator.fit(
+            *training,
+            **names,
+            n_estimators=int(evaluator_cfg.n_estimators),
+            min_samples_leaf=int(evaluator_cfg.min_samples_leaf),
+            max_features=float(evaluator_cfg.max_features),
+            n_jobs=int(evaluator_cfg.n_jobs),
+            random_state=int(random_state),
+            hvac_active_threshold_w=float(hvac_active_threshold_w),
+            hvac_component_name=component_power.get('hvac_component_name'),
         )
 
     if family in SKLEARN_FAMILIES:

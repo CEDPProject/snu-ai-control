@@ -24,11 +24,16 @@ from controllers.evaluator_benchmark import (
 from controllers.fixed_action_evaluation import (
     build_fixed_action_episode_holdout,
 )
+from controllers.kpi_coverage_summary import (
+    build_kpi_coverage_summary,
+    kpi_coverage_summary_rows,
+)
 from controllers.pipeline import run_mpc_pipeline
 from controllers.total_power_evaluation import (
     evaluate_all_chronological_test_total_power,
 )
 from data_provider.control_data import load_control_data
+from data_provider.dataset_versions import dataset_label_from_cfg
 from utils.log import setup_default_logging
 
 
@@ -128,7 +133,7 @@ def _result_directory(cfg) -> Path:
     )
     return (
         Path(cfg.RESULT.savedir)
-        / cfg.DATASET.data_version
+        / dataset_label_from_cfg(cfg)
         / cfg.DATASET.environment_name
         / 'mpc_experiments'
         / run_name
@@ -230,6 +235,13 @@ def _candidate_pool_experiments(cfg, data, holdout, artifact_root):
                 cfg.MPC.affine_models.mape_min_actual_power_w
             ),
             random_state=int(cfg.DEFAULT.seed) + 100 * scenario_index,
+            report_model_refit_scope=str(
+                OmegaConf.select(
+                    cfg,
+                    'MPC.evaluation.report_model_refit_scope',
+                    default='train_validation',
+                )
+            ),
         )
         result['experiment_scenario'] = {
             'name': name,
@@ -368,6 +380,13 @@ def _candidate_pool_top_k_sweep(cfg, data, artifact_root):
             cfg.MPC.affine_models.mape_min_actual_power_w
         ),
         random_state=int(cfg.DEFAULT.seed) + 10_000,
+        report_model_refit_scope=str(
+            OmegaConf.select(
+                cfg,
+                'MPC.evaluation.report_model_refit_scope',
+                default='train_validation',
+            )
+        ),
     )
     result['experiment_scenario'] = {
         'name': scenario_name,
@@ -463,11 +482,56 @@ def _run_full_mpc_for_selected(cfg, selected_family, result_dir):
         'Full MPC run for selected evaluator completed: family=%s',
         selected_family,
     )
+    # strict 공식 KPI에는 coverage/sample이 담기지 않으므로, candidate-pool 평가에서
+    # 실제 평가된 행 수와 coverage를 함께 꺼내 kpi_coverage_summary가 쓰게 한다.
+    candidate_pool_eval = summary.get('fixed_action_candidate_pool_evaluation') or {}
+    pool_test = candidate_pool_eval.get('test_evaluation') or {}
+    pool_selection = candidate_pool_eval.get('selection') or {}
+    counterfactual = (
+        summary.get('mpc_counterfactual_total_power_report_evaluation') or {}
+    )
+    counterfactual_metric = counterfactual.get('primary_metric') or {}
+    counterfactual_cases = counterfactual.get('mape_cases') or {}
+    counterfactual_test = counterfactual.get('test_evaluation') or {}
+    counterfactual_reduction = (
+        counterfactual.get('estimated_energy_reduction') or {}
+    )
+    report_to_report_reduction = (
+        counterfactual.get('report_to_report_predicted_energy_reduction') or {}
+    )
     return {
         'selected_family': selected_family,
         'result_directory': str(full_result_dir),
         'official_mape': summary['primary_metric'],
+        'strict_coverage_percent': pool_test.get('pool_exact_match_coverage_percent'),
+        'strict_evaluated_sample_count': pool_test.get('valid_primary_mape_sample_count'),
+        'strict_selected_candidate_count': pool_selection.get('selected_candidate_count'),
         'energy_reduction_percent': summary['energy_reduction_percent'],
+        'mpc_counterfactual_total_power_mape_percent': (
+            counterfactual_metric.get('value')
+        ),
+        'mpc_counterfactual_reportable': bool(
+            counterfactual_metric.get('reportable', False)
+        ),
+        'mpc_counterfactual_action_changed_percent': (
+            counterfactual_test.get('action_changed_percent')
+        ),
+        'mpc_counterfactual_estimated_reduction_percent': (
+            counterfactual_reduction.get('estimated_reduction_percent')
+        ),
+        'mpc_report_to_report_total_power_mape_percent': (
+            (counterfactual_cases.get(
+                'mpc_action_vs_recorded_action_report'
+            ) or {}).get('value')
+        ),
+        'mpc_report_to_report_reportable': bool(
+            (counterfactual_cases.get(
+                'mpc_action_vs_recorded_action_report'
+            ) or {}).get('reportable', False)
+        ),
+        'mpc_report_to_report_predicted_reduction_percent': (
+            report_to_report_reduction.get('estimated_reduction_percent')
+        ),
         'quality_assessment': summary['quality_assessment'],
     }
 
@@ -544,6 +608,13 @@ def run_evaluator_benchmark(cfg):
                 all_data_cfg.minimum_test_mape_samples
             ),
             random_state=int(cfg.DEFAULT.seed),
+            report_model_refit_scope=str(
+                OmegaConf.select(
+                    cfg,
+                    'MPC.evaluation.report_model_refit_scope',
+                    default='train_validation',
+                )
+            ),
         )
         LOGGER.info(
             'All chronological test-row evaluation completed: '
@@ -597,6 +668,38 @@ def run_evaluator_benchmark(cfg):
             full_mpc_root,
         )
 
+    # strict 공식 KPI와 완화 provisional 값을 coverage·신뢰등급과 함께 요약한다.
+    # support가 부족해 strict가 null이 되는 run도 provisional 값을 남겨 해석 가능하게
+    # 한다. provisional은 절대 공식값으로 승격하지 않는다(helper가 claim_boundary 부착).
+    kpi_coverage = None
+    provisional_summary_cfg = cfg.MPC.get('provisional_kpi_summary')
+    if provisional_summary_cfg is not None and bool(
+        provisional_summary_cfg.get('enabled', False)
+    ):
+        kpi_coverage = build_kpi_coverage_summary(
+            full_mpc_result=full_mpc_result,
+            candidate_summary_rows=candidate_summary_rows,
+            config=OmegaConf.to_container(provisional_summary_cfg, resolve=True),
+        )
+        summary_rows = kpi_coverage_summary_rows(kpi_coverage)
+        if summary_rows:
+            _write_dataframe(
+                candidate_root / 'kpi_coverage_summary.csv', summary_rows
+            )
+        strict = (kpi_coverage or {}).get('strict') or {}
+        provisional = (kpi_coverage or {}).get('provisional') or {}
+        LOGGER.info(
+            'KPI coverage summary: strict=%s (tier=%s, cov=%s) | '
+            'provisional=%s (tier=%s, cov=%s, source=%s)',
+            strict.get('mape_percent'),
+            strict.get('confidence_tier'),
+            strict.get('coverage_percent'),
+            provisional.get('mape_percent'),
+            provisional.get('confidence_tier'),
+            provisional.get('coverage_percent'),
+            provisional.get('source'),
+        )
+
     summary = {
         'protocol': {
             'name': 'mpc_evaluator_and_action_scope_experiment_matrix',
@@ -636,6 +739,7 @@ def run_evaluator_benchmark(cfg):
         'candidate_pool_top_k_sweep': top_k_sweep_result,
         'evaluator_benchmark': evaluator_benchmark,
         'full_mpc_selected_evaluator': full_mpc_result,
+        'kpi_coverage_summary': kpi_coverage,
     }
 
     _write_json(result_dir / 'experiment_matrix.json', summary)

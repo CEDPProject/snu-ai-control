@@ -1,3 +1,5 @@
-def create_model(modelname: str, params: dict = {}):
-    model = __import__('models').__dict__[modelname](params)
-    return model
+"""Compatibility entry point for existing forecast callers."""
+
+from .prediction.factory import create_model
+
+__all__ = ['create_model']

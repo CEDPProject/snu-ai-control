@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -15,6 +17,7 @@ from controllers.evaluation import (
     constraint_prediction_metrics,
     evaluate_observed_control_combinations,
     paired_bootstrap_energy_reduction,
+    run_receding_horizon_policy,
 )
 from controllers.fixed_action_evaluation import (
     build_fixed_action_episode_holdout,
@@ -28,6 +31,7 @@ from data_provider.control_data import (
     ControlVariable,
     consolidate_control_categories,
 )
+from data_provider.build_dataset import HVACDataset
 from dynamics.affine import (
     AffinePowerModel,
     AffineStateModel,
@@ -35,8 +39,139 @@ from dynamics.affine import (
 )
 from dynamics.evaluator_base import TransitionPredictions
 from models.common import target_channel_indices
+from runners.action_history_ablation_runner import (
+    _scenario_descriptors,
+    _lookbacks,
+    _normalized_recency_weights,
+    _scaled_rolling_change_budget,
+    _scenario_cfg as history_ablation_scenario_cfg,
+)
 from utils.metrics import Kweather_metric, cal_metric
 from utils.tools import EarlyStopping, create_lr_scheduler
+
+
+class ActionHistoryAblationContractTest(unittest.TestCase):
+    def test_lookback_sweep_keeps_penalty_mass_and_factual_boundary(self):
+        """L changes history duration, not the total regularization mass."""
+        cfg = OmegaConf.load(
+            Path(__file__).resolve().parents[1]
+            / 'src/configs/default_setting.yaml'
+        )
+        self.assertEqual(_lookbacks(cfg), [0, 1, 2, 5, 10, 30])
+        expected_budgets = {0: None, 1: 1, 2: 2, 5: 3, 10: 6, 30: 18}
+        for lookback, expected_budget in expected_budgets.items():
+            weights = _normalized_recency_weights(cfg, lookback)
+            self.assertEqual(len(weights), lookback)
+            if lookback:
+                self.assertAlmostEqual(sum(weights), 3.0)
+                self.assertGreaterEqual(weights[0], weights[-1])
+            self.assertEqual(
+                _scaled_rolling_change_budget(cfg, lookback), expected_budget
+            )
+
+        factual = history_ablation_scenario_cfg(cfg, 0)
+        self.assertFalse(factual.MPC.objective.action_history.enabled)
+        self.assertEqual(
+            factual.MPC.objective.maximum_changed_control_variables_per_step, 0
+        )
+        self.assertEqual(
+            factual.MPC.evaluation.mpc_counterfactual_total_power_report
+            .first_action_reference,
+            'recorded_current_action',
+        )
+
+        smoothed = history_ablation_scenario_cfg(cfg, 5)
+        self.assertTrue(smoothed.MPC.objective.action_history.enabled)
+        self.assertEqual(smoothed.MPC.objective.action_history.lookback_steps, 5)
+        self.assertEqual(
+            smoothed.MPC.objective.action_history.rolling_change_budget, 3
+        )
+        self.assertEqual(
+            smoothed.MPC.evaluation.mpc_counterfactual_total_power_report
+            .first_action_reference,
+            'recorded_previous_action',
+        )
+
+    def test_history_constraint_matrix_exposes_k_group_mode_and_penalty(self):
+        """L>0 points carry every requested regularization control explicitly."""
+        cfg = OmegaConf.load(
+            Path(__file__).resolve().parents[1]
+            / 'src/configs/default_setting.yaml'
+        )
+        cfg = OmegaConf.merge(cfg, {
+            'MPC': {'action_history_ablation': {
+                'lookback_steps': [0, 1],
+                'hard_distances': [1, 2],
+                'history_group_modes': ['per_control_variable'],
+                'history_penalties': [0.5, 2.0],
+                'per_group_rolling_change_budget_reference_values': {
+                    'equipment': None,
+                    'per_control_variable': {'환기전원': 1},
+                },
+            }},
+        })
+
+        descriptors = _scenario_descriptors(cfg)
+        self.assertEqual(len(descriptors), 5)  # one factual + 2 K × 2 penalties
+        self.assertEqual(descriptors[0]['scenario_id'], 'l00_factual')
+        constrained = descriptors[1:]
+        self.assertEqual(
+            {item['hard_distance_k'] for item in constrained}, {1, 2}
+        )
+        self.assertEqual(
+            {item['history_penalty'] for item in constrained}, {0.5, 2.0}
+        )
+        self.assertEqual(
+            {item['history_group_mode'] for item in constrained},
+            {'per_control_variable'},
+        )
+        self.assertTrue(all(
+            item['per_group_rolling_change_budgets'] == {'환기전원': 1}
+            for item in constrained
+        ))
+
+        scenario = history_ablation_scenario_cfg(
+            cfg,
+            1,
+            hard_distance=1,
+            history_group_mode='per_control_variable',
+            history_penalty=2.0,
+            per_group_rolling_change_budgets={'환기전원': 1},
+        )
+        self.assertEqual(
+            scenario.MPC.objective.maximum_changed_control_variables_per_step,
+            1,
+        )
+        self.assertIsNone(scenario.MPC.objective.action_history.groups)
+        self.assertEqual(scenario.MPC.objective.action_history.penalty, 2.0)
+        self.assertEqual(
+            scenario.MPC.objective.action_history.per_group_rolling_change_budgets,
+            {'환기전원': 1},
+        )
+
+    def test_per_group_only_history_budget_can_disable_aggregate_budget(self):
+        """A variable-specific experiment need not retain equipment aggregate caps."""
+        cfg = OmegaConf.load(
+            Path(__file__).resolve().parents[1]
+            / 'src/configs/default_setting.yaml'
+        )
+        cfg = OmegaConf.merge(cfg, {
+            'MPC': {'action_history_ablation': {
+                'rolling_change_budget_reference_value': None,
+            }},
+        })
+        self.assertIsNone(_scaled_rolling_change_budget(cfg, 1))
+        scenario = history_ablation_scenario_cfg(
+            cfg,
+            1,
+            hard_distance=1,
+            history_group_mode='per_control_variable',
+            history_penalty=2.0,
+            per_group_rolling_change_budgets={'환기전원': 1},
+        )
+        self.assertIsNone(
+            scenario.MPC.objective.action_history.rolling_change_budget
+        )
 
 
 class TargetChannelContractTest(unittest.TestCase):
@@ -49,6 +184,56 @@ class TargetChannelContractTest(unittest.TestCase):
             }
         }
         self.assertEqual(target_channel_indices(configs, 4), (9,))
+
+
+class SegmentedDatasetContractTest(unittest.TestCase):
+    def test_forecast_dataset_does_not_cross_segment_boundaries(self):
+        data = np.arange(10, dtype=float).reshape(-1, 1)
+        timestamps = pd.date_range('2025-01-01', periods=10, freq='min')
+        segment_ids = np.array([0] * 5 + [1] * 5)
+
+        dataset = HVACDataset(
+            data=data,
+            timestamps=timestamps,
+            seq_len=3,
+            pred_len=2,
+            stride_len=1,
+            features=['power'],
+            target_features=['power'],
+            numerical_feature=['power'],
+            segment_ids=segment_ids,
+            prevent_cross_segment_windows=True,
+        )
+
+        self.assertEqual(dataset.start_indices.tolist(), [0, 5])
+        for start in dataset.start_indices:
+            window_segments = segment_ids[start : start + dataset.total_len]
+            self.assertEqual(len(set(window_segments.tolist())), 1)
+
+    def test_mpc_transition_mask_requires_same_segment(self):
+        encoder = ControlEncoder(
+            [ControlVariable('control', ('OFF', 'ON'), 'OFF')]
+        )
+        controls = np.vstack(
+            [encoder.encode_action({'control': 'OFF'}) for _ in range(4)]
+        )
+        data = ControlData(
+            timestamps=pd.Series(
+                pd.date_range('2025-01-01', periods=4, freq='min')
+            ),
+            states=np.zeros((4, 1)),
+            controls=controls,
+            disturbances=np.empty((4, 0)),
+            powers=np.ones((4, 1)),
+            state_names=('state',),
+            disturbance_names=(),
+            power_names=('power_w',),
+            encoder=encoder,
+            segment_ids=np.array([0, 0, 1, 1]),
+            source_versions=('v1', 'v2'),
+        )
+
+        self.assertEqual(data.transition_mask(0, 3).tolist(), [True, False, True])
 
 
 class MixedIntegerMPCContractTest(unittest.TestCase):
@@ -162,6 +347,378 @@ class MixedIntegerMPCContractTest(unittest.TestCase):
         )
         self.assertGreaterEqual(solution.state_trajectory[1, 0], 10.0)
 
+    def test_dynamic_forbidden_action_applies_only_to_first_planned_step(self):
+        """A local action gate must not incorrectly freeze the full plan."""
+        encoder = ControlEncoder(
+            [ControlVariable('switch', ('OFF', 'ON'), 'OFF')]
+        )
+        state_model = AffineStateModel(
+            A=np.array([[1.0]]),
+            B=np.zeros((1, 2)),
+            E=np.zeros((1, 0)),
+            c=np.zeros(1),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        # ON is cheaper at every minute, so it is the unconstrained optimum.
+        power_model = AffinePowerModel(
+            F=np.zeros((1, 1)),
+            G=np.array([[0.0, -9.0]]),
+            H=np.zeros((1, 0)),
+            b=np.array([10.0]),
+            power_names=('power_w',),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        controller = MixedIntegerMPC(
+            state_model=state_model,
+            power_model=power_model,
+            encoder=encoder,
+            state_constraints=[
+                {'name': 'state', 'lower': None, 'upper': None, 'penalty': 1.0}
+            ],
+            logical_rules=[],
+            prediction_horizon=2,
+            control_horizon=2,
+            switch_penalty=0.0,
+        )
+
+        on = encoder.encode_action({'switch': 'ON'})
+        solution = controller.solve(
+            initial_state=np.array([0.0]),
+            disturbances=np.empty((2, 0)),
+            first_step_forbidden_control_vectors=on[None, :],
+        )
+
+        self.assertTrue(solution.success)
+        self.assertEqual(solution.actions[0], {'switch': 'OFF'})
+        # The local exclusion is deliberately only for z_0; z_1 remains a
+        # provisional, unconstrained (and cheaper) future plan action.
+        self.assertEqual(solution.actions[1], {'switch': 'ON'})
+
+    def test_cap_limits_changed_categorical_variables_not_one_hot_bits(self):
+        encoder = ControlEncoder(
+            [
+                ControlVariable('first', ('OFF', 'ON'), 'OFF'),
+                ControlVariable('second', ('OFF', 'ON'), 'OFF'),
+            ]
+        )
+        state_model = AffineStateModel(
+            A=np.array([[1.0]]),
+            B=np.zeros((1, 4)),
+            E=np.zeros((1, 0)),
+            c=np.zeros(1),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        # Turning either switch ON reduces nonnegative power.  The optimizer
+        # would turn both ON immediately without the categorical-change cap.
+        power_model = AffinePowerModel(
+            F=np.zeros((1, 1)),
+            G=np.array([[0.0, -10.0, 0.0, -10.0]]),
+            H=np.zeros((1, 0)),
+            b=np.array([25.0]),
+            power_names=('power_w',),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        controller = MixedIntegerMPC(
+            state_model=state_model,
+            power_model=power_model,
+            encoder=encoder,
+            state_constraints=[
+                {'name': 'state', 'lower': None, 'upper': None, 'penalty': 1.0}
+            ],
+            logical_rules=[],
+            prediction_horizon=2,
+            control_horizon=2,
+            switch_penalty=0.0,
+            maximum_changed_control_variables_per_step=1,
+        )
+        previous = encoder.encode_action({'first': 'OFF', 'second': 'OFF'})
+        solution = controller.solve(
+            initial_state=np.array([0.0]),
+            disturbances=np.empty((2, 0)),
+            previous_control=previous,
+        )
+
+        self.assertTrue(solution.success)
+        planned = np.vstack((previous, solution.control_vectors))
+        for prior, current in zip(planned[:-1], planned[1:]):
+            changed_variables = sum(
+                not np.array_equal(prior[list(group)], current[list(group)])
+                for group in encoder.groups.values()
+            )
+            self.assertLessEqual(changed_variables, 1)
+        # The first action changes exactly one *variable*, even though a
+        # category switch flips two one-hot bits.
+        self.assertEqual(
+            sum(
+                not np.array_equal(previous[list(group)], solution.control_vectors[0, list(group)])
+                for group in encoder.groups.values()
+            ),
+            1,
+        )
+
+    def test_recent_action_history_penalty_prefers_a_stable_first_action(self):
+        """The first action is compared with every configured past action."""
+        encoder = ControlEncoder(
+            [ControlVariable('switch', ('OFF', 'ON'), 'OFF')]
+        )
+        state_model = AffineStateModel(
+            A=np.array([[1.0]]),
+            B=np.zeros((1, 2)),
+            E=np.zeros((1, 0)),
+            c=np.zeros(1),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        power_model = AffinePowerModel(
+            F=np.zeros((1, 1)),
+            G=np.array([[0.0, -9.0]]),
+            H=np.zeros((1, 0)),
+            b=np.array([10.0]),
+            power_names=('power_w',),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        controller = MixedIntegerMPC(
+            state_model=state_model,
+            power_model=power_model,
+            encoder=encoder,
+            state_constraints=[
+                {'name': 'state', 'lower': None, 'upper': None, 'penalty': 1.0}
+            ],
+            logical_rules=[],
+            prediction_horizon=1,
+            control_horizon=1,
+            switch_penalty=0.0,
+            maximum_changed_control_variables_per_step=1,
+            action_history_enabled=True,
+            action_history_lookback_steps=3,
+            action_history_penalty=1.0,
+            action_history_recency_weights=[1.0, 0.8, 0.6],
+        )
+        off = encoder.encode_action({'switch': 'OFF'})
+        solution = controller.solve(
+            initial_state=np.array([0.0]),
+            disturbances=np.empty((1, 0)),
+            previous_control=off,
+            action_history=np.vstack([off, off, off]),
+        )
+
+        # ON would reduce power from 10 W to 1 W, but differs from all three
+        # recent actions and is therefore dominated by the history penalty.
+        self.assertTrue(solution.success)
+        self.assertEqual(solution.actions[0], {'switch': 'OFF'})
+        diagnostics = controller.action_history_diagnostics(
+            solution.control_vectors[0],
+            np.vstack([off, off, off]),
+            previous_control=off,
+        )
+        self.assertEqual(diagnostics['distance_by_lag'], {
+            'lag_1': 0,
+            'lag_2': 0,
+            'lag_3': 0,
+        })
+        self.assertAlmostEqual(diagnostics['weighted_distance'], 0.0)
+
+    def test_categorical_solution_boundary_canonicalizes_residue_and_rejects_relaxation(self):
+        """A fractional LP point is never reused as a categorical action."""
+        encoder = ControlEncoder(
+            [
+                ControlVariable('first', ('OFF', 'ON'), 'OFF'),
+                ControlVariable('second', ('LOW', 'HIGH'), 'LOW'),
+            ]
+        )
+        state_model = AffineStateModel(
+            A=np.array([[1.0]]),
+            B=np.zeros((1, encoder.n_features)),
+            E=np.zeros((1, 0)),
+            c=np.zeros(1),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        power_model = AffinePowerModel(
+            F=np.zeros((1, 1)),
+            G=np.zeros((1, encoder.n_features)),
+            H=np.zeros((1, 0)),
+            b=np.ones(1),
+            power_names=('power_w',),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        controller = MixedIntegerMPC(
+            state_model=state_model,
+            power_model=power_model,
+            encoder=encoder,
+            state_constraints=[
+                {'name': 'state', 'lower': None, 'upper': None, 'penalty': 1.0}
+            ],
+            logical_rules=[],
+            prediction_horizon=1,
+            control_horizon=1,
+        )
+        canonical = controller._canonicalize_categorical_controls(
+            np.array([[1e-9, 0.999999999, 0.999999999, 1e-9]])
+        )
+        np.testing.assert_array_equal(
+            canonical,
+            encoder.encode_action({'first': 'ON', 'second': 'LOW'})[None, :],
+        )
+        self.assertIsNone(
+            controller._canonicalize_categorical_controls(
+                np.array([[0.5, 0.5, 1.0, 0.0]])
+            )
+        )
+
+    def test_recent_action_rolling_budget_limits_repeated_switching(self):
+        """Past changes consume the same five-minute budget as z_t changes."""
+        encoder = ControlEncoder(
+            [ControlVariable('switch', ('OFF', 'ON'), 'OFF')]
+        )
+        state_model = AffineStateModel(
+            A=np.array([[1.0]]),
+            B=np.zeros((1, 2)),
+            E=np.zeros((1, 0)),
+            c=np.zeros(1),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        power_model = AffinePowerModel(
+            F=np.zeros((1, 1)),
+            G=np.array([[0.0, -9.0]]),
+            H=np.zeros((1, 0)),
+            b=np.array([10.0]),
+            power_names=('power_w',),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        controller = MixedIntegerMPC(
+            state_model=state_model,
+            power_model=power_model,
+            encoder=encoder,
+            state_constraints=[
+                {'name': 'state', 'lower': None, 'upper': None, 'penalty': 1.0}
+            ],
+            logical_rules=[],
+            prediction_horizon=1,
+            control_horizon=1,
+            switch_penalty=0.0,
+            maximum_changed_control_variables_per_step=1,
+            action_history_enabled=True,
+            action_history_lookback_steps=3,
+            action_history_penalty=0.0,
+            action_history_rolling_change_budget=2,
+            action_history_budget_slack_penalty=100.0,
+        )
+        off = encoder.encode_action({'switch': 'OFF'})
+        on = encoder.encode_action({'switch': 'ON'})
+        # OFF -> ON -> OFF has already consumed two action changes. Selecting
+        # ON again would create a third change and pay the large slack cost.
+        history = np.vstack([off, on, off])
+        solution = controller.solve(
+            initial_state=np.array([0.0]),
+            disturbances=np.empty((1, 0)),
+            previous_control=off,
+            action_history=history,
+        )
+
+        self.assertTrue(solution.success)
+        self.assertEqual(solution.actions[0], {'switch': 'OFF'})
+        diagnostics = controller.action_history_diagnostics(
+            solution.control_vectors[0],
+            history,
+            previous_control=off,
+        )
+        self.assertEqual(diagnostics['historical_change_count'], 2)
+        self.assertEqual(diagnostics['rolling_change_count'], 2)
+        self.assertEqual(diagnostics['rolling_budget_overflow'], 0.0)
+
+    def test_per_control_variable_history_budget_limits_only_named_variable(self):
+        """Independent group budgets work with the automatic per-variable mode."""
+        encoder = ControlEncoder(
+            [
+                ControlVariable('guarded', ('OFF', 'ON'), 'OFF'),
+                ControlVariable('free', ('OFF', 'ON'), 'OFF'),
+            ]
+        )
+        state_model = AffineStateModel(
+            A=np.array([[1.0]]),
+            B=np.zeros((1, encoder.n_features)),
+            E=np.zeros((1, 0)),
+            c=np.zeros(1),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        # The guarded ON setting would save more power than free ON. Its
+        # independent recent-history budget is zero, so the optimizer must
+        # select only the unrestricted variable despite the energy incentive.
+        power_model = AffinePowerModel(
+            F=np.zeros((1, 1)),
+            G=np.array([[0.0, -9.0, 0.0, -2.0]]),
+            H=np.zeros((1, 0)),
+            b=np.array([10.0]),
+            power_names=('power_w',),
+            state_names=('state',),
+            control_feature_names=encoder.feature_names,
+            disturbance_names=(),
+        )
+        controller = MixedIntegerMPC(
+            state_model=state_model,
+            power_model=power_model,
+            encoder=encoder,
+            state_constraints=[
+                {'name': 'state', 'lower': None, 'upper': None, 'penalty': 1.0}
+            ],
+            logical_rules=[],
+            prediction_horizon=1,
+            control_horizon=1,
+            switch_penalty=0.0,
+            maximum_changed_control_variables_per_step=2,
+            action_history_enabled=True,
+            action_history_lookback_steps=2,
+            action_history_penalty=0.0,
+            action_history_recency_weights=[1.0, 1.0],
+            # No explicit groups means one budget unit per control variable.
+            action_history_per_group_rolling_change_budgets={'guarded': 0},
+            action_history_budget_slack_penalty=100.0,
+        )
+        off = encoder.encode_action({'guarded': 'OFF', 'free': 'OFF'})
+        solution = controller.solve(
+            initial_state=np.array([0.0]),
+            disturbances=np.empty((1, 0)),
+            previous_control=off,
+            action_history=np.vstack([off, off]),
+        )
+
+        self.assertTrue(solution.success)
+        self.assertEqual(solution.actions[0], {'guarded': 'OFF', 'free': 'ON'})
+        diagnostics = controller.action_history_diagnostics(
+            solution.control_vectors[0],
+            np.vstack([off, off]),
+            previous_control=off,
+        )
+        self.assertEqual(
+            diagnostics['per_group_rolling_change_budgets'], {'guarded': 0}
+        )
+        self.assertEqual(diagnostics['current_change_by_group']['guarded'], 0)
+        self.assertEqual(diagnostics['current_change_by_group']['free'], 1)
+        self.assertEqual(
+            diagnostics['per_group_rolling_budget_overflow'], {'guarded': 0.0}
+        )
+
     def test_power_mape_reports_threshold_and_coverage(self):
         actual = np.array(
             [
@@ -246,6 +803,97 @@ class MPCEvaluationContractTest(unittest.TestCase):
                 'minimum_test_episodes_per_candidate': 3,
             }
         )
+
+    def test_closed_loop_action_history_uses_prior_mpc_actions_after_bootstrap(self):
+        """The second decision must not read the future recorded control."""
+        encoder = ControlEncoder(
+            [ControlVariable('switch', ('OFF', 'ON'), 'OFF')]
+        )
+        off = encoder.encode_action({'switch': 'OFF'})
+        on = encoder.encode_action({'switch': 'ON'})
+        row_count = 8
+        data = ControlData(
+            timestamps=pd.Series(
+                pd.date_range('2025-01-01', periods=row_count, freq='min')
+            ),
+            states=np.zeros((row_count, 1)),
+            controls=np.repeat(off[None, :], row_count, axis=0),
+            disturbances=np.empty((row_count, 0)),
+            powers=np.ones((row_count, 1)),
+            state_names=('state',),
+            disturbance_names=(),
+            power_names=('power_w',),
+            encoder=encoder,
+        )
+
+        class PowerModel:
+            def predict_components(self, states, controls, disturbances):
+                return np.zeros((len(np.atleast_2d(states)), 1), dtype=float)
+
+        class HistoryCapturingController:
+            prediction_horizon = 1
+            action_history_enabled = True
+            action_history_lookback_steps = 2
+            power_model = PowerModel()
+            histories = []
+
+            def solve(
+                self,
+                initial_state,
+                disturbances,
+                previous_control,
+                action_history=None,
+            ):
+                del initial_state, disturbances, previous_control
+                self.histories.append(np.asarray(action_history, dtype=float).copy())
+                return SimpleNamespace(
+                    success=True,
+                    status=0,
+                    message='optimal',
+                    objective=0.0,
+                    control_vectors=on[None, :].copy(),
+                )
+
+            def action_history_diagnostics(
+                self,
+                applied_control,
+                action_history,
+                previous_control=None,
+            ):
+                del applied_control, action_history, previous_control
+                return {
+                    'enabled': True,
+                    'lookback_steps_used': 2,
+                    'weighted_distance': 0.0,
+                    'historical_change_count': 0,
+                    'current_change_count': 0,
+                    'rolling_change_count': 0,
+                    'rolling_change_budget': 3,
+                    'rolling_budget_overflow': 0.0,
+                    'distance_by_lag': {'lag_1': 0, 'lag_2': 0},
+                }
+
+        class StatelessPlant:
+            def step(self, state, control, disturbance):
+                del control, disturbance
+                return np.asarray(state, dtype=float).copy(), np.array([0.0])
+
+        controller = HistoryCapturingController()
+        run_receding_horizon_policy(
+            controller,
+            StatelessPlant(),
+            data,
+            start=2,
+            duration_steps=2,
+            disturbance_forecast_method='persistence',
+            training_control_support=data.controls[:2],
+        )
+
+        self.assertTrue(np.array_equal(controller.histories[0], np.vstack([off, off])))
+        # The first MPC action is ON. It must replace the oldest bootstrap
+        # action in the next two-step history, even though the recorded t=2
+        # action remains OFF.
+        self.assertTrue(np.array_equal(controller.histories[1], np.vstack([off, on])))
 
     def test_fixed_action_holdout_is_episode_disjoint_and_outcome_blind(self):
         data = self._repeated_action_episode_data()

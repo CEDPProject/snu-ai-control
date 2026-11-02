@@ -1,12 +1,21 @@
 import logging
-from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder, StandardScaler, MinMaxScaler
 import warnings
 
+from data_provider.dataset_versions import (
+    configured_data_versions,
+    dataset_version_label,
+    resolve_dataset_csv_path,
+)
+
 
 logger = logging.getLogger('DATA')
+
+# 'global': 세그먼트를 이어 붙인 전체 표를 한 번에 비율 분할 (기존 동작)
+# 'per_segment': 세그먼트(데이터 버전)마다 같은 비율로 시간순 분할한 뒤 split별로 이어 붙임
+SEGMENT_SPLIT_MODES = ('global', 'per_segment')
 
 def load_dataset(
                 datadir: str,
@@ -18,6 +27,10 @@ def load_dataset(
                 target_features: list,
                 data_version: str,
                 environment_name: str,
+                data_versions: list = None,
+                merge_strategy: str = 'segmented_concat',
+                prevent_cross_segment_windows: bool = True,
+                segment_split: str = 'global',
                 split_rate: list = [0.8, 0.1, 0.1],
                 del_feature: list = None,
                 split_date: str = None,
@@ -26,23 +39,46 @@ def load_dataset(
                 ):
 
     # 1. 데이터 로드
-    # Resolve paths from both the caller cwd and src directory.
-    configured_base = Path(datadir).expanduser()
-    src_dir = Path(__file__).resolve().parents[1]
-    base_candidates = [configured_base, Path.cwd() / configured_base, src_dir / configured_base]
-    file_name = f"{environment_name}.csv"
-    file_path = next(
-        (candidate.resolve() / data_version / file_name for candidate in base_candidates
-         if (candidate.resolve() / data_version / file_name).is_file()),
-        None,
-    )
-    if file_path is None:
-        searched = [str(candidate.resolve() / data_version / file_name) for candidate in base_candidates]
-        raise FileNotFoundError(f"Dataset CSV not found. Searched: {searched}")
-
-    df_raw = pd.read_csv(file_path)
+    versions = configured_data_versions(data_version, data_versions)
+    if len(versions) > 1 and merge_strategy != 'segmented_concat':
+        raise ValueError(
+            "Only DATASET.merge_strategy='segmented_concat' is supported for "
+            "multi-version datasets"
+        )
+    if segment_split not in SEGMENT_SPLIT_MODES:
+        raise ValueError(
+            f"Unknown DATASET.segment_split {segment_split!r}; "
+            f"use one of {SEGMENT_SPLIT_MODES}"
+        )
+    if segment_split == 'per_segment' and split_date is not None:
+        raise ValueError(
+            "DATASET.segment_split='per_segment' applies to ratio splits only; "
+            "set DATASET.split_date=null"
+        )
+    frames = []
+    for segment_id, version in enumerate(versions):
+        file_path = resolve_dataset_csv_path(datadir, version, environment_name)
+        frame = pd.read_csv(file_path)
+        frame['__source_version'] = version
+        frame['__segment_id'] = segment_id
+        frames.append(frame)
+    df_raw = pd.concat(frames, ignore_index=True)
     df_raw['데이터 시간'] = pd.to_datetime(df_raw['데이터 시간'])
-    timestamps = df_raw['데이터 시간'].copy()
+    df_raw = (
+        df_raw.sort_values(['__segment_id', '데이터 시간'])
+        .drop_duplicates(['__segment_id', '데이터 시간'], keep='last')
+        .reset_index(drop=True)
+    )
+    dataset_label = dataset_version_label(data_version, data_versions)
+    logger.info(
+        'Loaded dataset: label=%s | versions=%s | environment=%s | rows=%d | '
+        'prevent_cross_segment_windows=%s',
+        dataset_label,
+        list(versions),
+        environment_name,
+        len(df_raw),
+        bool(prevent_cross_segment_windows),
+    )
 
     # 삭제할 컬럼 제거
     if del_feature is not None:
@@ -58,10 +94,22 @@ def load_dataset(
         df_raw = remove_target_outliers(df_raw, target_features, outlier_thresholds)
         # timestamp도 동일하게 필터링
         timestamps = df_raw['데이터 시간'].copy()
+        segment_ids = df_raw['__segment_id'].copy()
+
+    else:
+        timestamps = df_raw['데이터 시간'].copy()
+        segment_ids = df_raw['__segment_id'].copy()
 
     # 2. 결측치 처리
-    df_raw = handle_missing_values(df_raw, ord_categorical_feature,
-                                    categorical_feature, numerical_feature)
+    df_raw = handle_missing_values_by_segment(
+        df_raw,
+        '__segment_id',
+        ord_categorical_feature,
+        categorical_feature,
+        numerical_feature,
+    )
+    timestamps = df_raw['데이터 시간'].copy()
+    segment_ids = df_raw['__segment_id'].copy()
 
     # 3. Feature 인코딩
     encoded_df, feature_names, encoders = encode_features(
@@ -76,10 +124,13 @@ def load_dataset(
     if split_date is not None or start_date is not None:
         # 날짜 기준 분할
         data_dict = split_by_date(encoded_df, timestamps,
-                                    split_date, split_rate, start_date, end_date)
+                                    split_date, split_rate, start_date, end_date,
+                                    segment_ids=segment_ids,
+                                    segment_split=segment_split)
     else:
         # 비율 기준 분할
-        data_dict = split_by_ratio(encoded_df, timestamps, split_rate)
+        data_dict = split_by_ratio(encoded_df, timestamps, split_rate, segment_ids,
+                                   segment_split=segment_split)
 
     # 5. 스케일링 (timestamp는 제외)
     scaler_dict = {}
@@ -91,6 +142,11 @@ def load_dataset(
     # 인코더 저장
     scaler_dict['encoders'] = encoders
     scaler_dict['feature_names'] = feature_names
+    scaler_dict['data_versions'] = list(versions)
+    scaler_dict['data_version_label'] = dataset_label
+    scaler_dict['merge_strategy'] = merge_strategy
+    scaler_dict['prevent_cross_segment_windows'] = bool(prevent_cross_segment_windows)
+    scaler_dict['segment_split'] = segment_split
     scaler_dict['feature_indices'] = {
         'ordinal': [i for i, name in enumerate(feature_names)
                     if any(ord_feat in name for ord_feat in ord_categorical_feature)],
@@ -391,6 +447,34 @@ def handle_missing_values(
     return df_result
 
 
+def handle_missing_values_by_segment(
+    df,
+    segment_column,
+    ord_categorical_feature,
+    categorical_feature,
+    numerical_feature,
+):
+    """Apply existing missing-value rules without filling across segments."""
+    if segment_column not in df.columns:
+        return handle_missing_values(
+            df,
+            ord_categorical_feature,
+            categorical_feature,
+            numerical_feature,
+        )
+    parts = []
+    for _, group in df.groupby(segment_column, sort=False):
+        parts.append(
+            handle_missing_values(
+                group.copy(),
+                ord_categorical_feature,
+                categorical_feature,
+                numerical_feature,
+            )
+        )
+    return pd.concat(parts, ignore_index=True)
+
+
 def _handle_numerical_missing(df, features, method):
     """
     수치형 변수 결측치 처리
@@ -583,7 +667,7 @@ def apply_scaling(data_dict, scaler_method, feature_names, target_features):
     return data_dict, scaler, target_scaler
 
 def split_by_date(encoded_df, timestamps, split_date=None, split_rate=[0.8, 0.1, 0.1],
-                  start_date=None, end_date=None):
+                  start_date=None, end_date=None, segment_ids=None, segment_split='global'):
     """
     시계열 데이터를 train/val/test 분할 (timestamp 포함)
 
@@ -605,16 +689,29 @@ def split_by_date(encoded_df, timestamps, split_date=None, split_rate=[0.8, 0.1,
     # 날짜 범위로 데이터 필터링
     valid_mask = (timestamps >= start_dt) & (timestamps <= end_dt)
 
+    if segment_ids is None:
+        segment_ids = pd.Series(np.zeros(len(timestamps), dtype=int), index=timestamps.index)
+
     if isinstance(encoded_df, pd.DataFrame):
         filtered_df = encoded_df[valid_mask]
         filtered_timestamps = timestamps[valid_mask]
+        filtered_segments = segment_ids[valid_mask]
     else:
         filtered_df = encoded_df[valid_mask.values] if hasattr(valid_mask, 'values') else encoded_df[valid_mask]
         filtered_timestamps = timestamps[valid_mask.values] if hasattr(valid_mask, 'values') else timestamps[valid_mask]
+        filtered_segments = segment_ids[valid_mask.values] if hasattr(valid_mask, 'values') else segment_ids[valid_mask]
 
     # split_date가 없으면 split_rate로만 분할
     if split_date is None:
-        return _split_by_ratio_only(filtered_df, filtered_timestamps, split_rate, start_dt, end_dt)
+        return _split_by_ratio_only(
+            filtered_df,
+            filtered_timestamps,
+            split_rate,
+            start_dt,
+            end_dt,
+            filtered_segments,
+            segment_split=segment_split,
+        )
 
     # 2. split_rate 분리 (date 기반 분할용)
     train_ratio, val_ratio = split_rate[0], split_rate[1]
@@ -626,17 +723,20 @@ def split_by_date(encoded_df, timestamps, split_date=None, split_rate=[0.8, 0.1,
     trainval_data, trainval_timestamps, test_data, test_timestamps = _split_trainval_test(
         filtered_df, filtered_timestamps, start_dt, trainval_end, end_dt
     )
+    trainval_segments, test_segments = _split_trainval_test_segments(
+        filtered_timestamps, filtered_segments, start_dt, trainval_end, end_dt
+    )
 
     # 5. 2단계 분할: train vs val
-    train_data, train_timestamps, val_data, val_timestamps = _split_train_val(
-        trainval_data, trainval_timestamps, train_ratio, val_ratio
+    train_data, train_timestamps, val_data, val_timestamps, train_segments, val_segments = _split_train_val(
+        trainval_data, trainval_timestamps, train_ratio, val_ratio, trainval_segments
     )
 
     # 6. 결과 딕셔너리 생성
     data_dict = {
-        'train': {'data': train_data, 'timestamps': train_timestamps},
-        'val': {'data': val_data, 'timestamps': val_timestamps},
-        'test': {'data': test_data, 'timestamps': test_timestamps}
+        'train': {'data': train_data, 'timestamps': train_timestamps, 'segment_ids': train_segments},
+        'val': {'data': val_data, 'timestamps': val_timestamps, 'segment_ids': val_segments},
+        'test': {'data': test_data, 'timestamps': test_timestamps, 'segment_ids': test_segments}
     }
 
     # 7. 정보 출력
@@ -648,7 +748,61 @@ def split_by_date(encoded_df, timestamps, split_date=None, split_rate=[0.8, 0.1,
     return data_dict
 
 
-def _split_by_ratio_only(encoded_df, timestamps, split_rate, start_dt, end_dt):
+def _ratio_split_positions(n_samples, split_rate, segment_ids=None, segment_split='global'):
+    """train/val/test에 해당하는 행 위치(positional index)를 반환한다.
+
+    'global'은 전체를 한 번에 자르고, 'per_segment'는 세그먼트마다 같은 비율로
+    시간순 분할한 뒤 split별로 세그먼트 순서대로 이어 붙인다. 세그먼트가 하나면
+    두 방식의 결과는 같다.
+    """
+    if segment_split not in SEGMENT_SPLIT_MODES:
+        raise ValueError(
+            f"Unknown segment_split {segment_split!r}; use one of {SEGMENT_SPLIT_MODES}"
+        )
+    train_ratio, val_ratio = split_rate[0], split_rate[1]
+    if segment_split == 'per_segment' and segment_ids is not None:
+        segments = np.asarray(segment_ids)
+        groups = [np.flatnonzero(segments == segment) for segment in pd.unique(segments)]
+    else:
+        groups = [np.arange(n_samples)]
+
+    positions = {'train': [], 'val': [], 'test': []}
+    for group in groups:
+        train_size = int(len(group) * train_ratio)
+        val_size = int(len(group) * val_ratio)
+        positions['train'].append(group[:train_size])
+        positions['val'].append(group[train_size:train_size + val_size])
+        positions['test'].append(group[train_size + val_size:])
+    return {
+        name: np.concatenate(parts) if parts else np.array([], dtype=int)
+        for name, parts in positions.items()
+    }
+
+
+def _take_rows(values, positions):
+    """DataFrame/Series/ndarray에서 위치 기준으로 행을 골라 ndarray로 반환한다."""
+    if isinstance(values, (pd.DataFrame, pd.Series)):
+        return values.iloc[positions].to_numpy()
+    return np.asarray(values)[positions]
+
+
+def _log_per_segment_split(data_dict):
+    """per_segment 분할에서 split별·세그먼트별 행 수와 기간을 기록한다."""
+    logger.info("Per-segment split breakdown:")
+    for name in ['train', 'val', 'test']:
+        split = data_dict[name]
+        segments = np.asarray(split['segment_ids'])
+        timestamps = pd.to_datetime(split['timestamps'])
+        for segment in pd.unique(segments):
+            mask = segments == segment
+            logger.info(
+                f"  {name.capitalize():5s} | segment {segment}: {int(mask.sum()):,} rows | "
+                f"{timestamps[mask].min():%Y-%m-%d %H:%M} ~ {timestamps[mask].max():%Y-%m-%d %H:%M}"
+            )
+
+
+def _split_by_ratio_only(encoded_df, timestamps, split_rate, start_dt, end_dt, segment_ids=None,
+                         segment_split='global'):
     """
     split_rate만으로 train/val/test 분할 (날짜 기준 없이)
 
@@ -657,44 +811,26 @@ def _split_by_ratio_only(encoded_df, timestamps, split_rate, start_dt, end_dt):
         timestamps: 필터링된 타임스탬프
         split_rate: [train_ratio, val_ratio, test_ratio]
         start_dt, end_dt: 날짜 범위 (출력용)
+        segment_split: 'global' 또는 'per_segment' (SEGMENT_SPLIT_MODES 참고)
     """
-    train_ratio, val_ratio, test_ratio = split_rate
-
     n_samples = len(encoded_df)
+    positions = _ratio_split_positions(n_samples, split_rate, segment_ids, segment_split)
+    if segment_ids is None:
+        segment_ids = np.zeros(n_samples, dtype=int)
 
-    # 분할 인덱스 계산
-    train_size = int(n_samples * train_ratio)
-    val_size = int(n_samples * val_ratio)
-
-    # 데이터 분할
-    if isinstance(encoded_df, pd.DataFrame):
-        train_data = encoded_df.iloc[:train_size].values
-        val_data = encoded_df.iloc[train_size:train_size+val_size].values
-        test_data = encoded_df.iloc[train_size+val_size:].values
-    else:
-        train_data = encoded_df[:train_size]
-        val_data = encoded_df[train_size:train_size+val_size]
-        test_data = encoded_df[train_size+val_size:]
-
-    # 타임스탬프 분할
-    if isinstance(timestamps, pd.Series):
-        train_timestamps = timestamps.iloc[:train_size].values
-        val_timestamps = timestamps.iloc[train_size:train_size+val_size].values
-        test_timestamps = timestamps.iloc[train_size+val_size:].values
-    else:
-        train_timestamps = timestamps[:train_size]
-        val_timestamps = timestamps[train_size:train_size+val_size]
-        test_timestamps = timestamps[train_size+val_size:]
-
-    # 결과 딕셔너리
     data_dict = {
-        'train': {'data': train_data, 'timestamps': train_timestamps},
-        'val': {'data': val_data, 'timestamps': val_timestamps},
-        'test': {'data': test_data, 'timestamps': test_timestamps}
+        name: {
+            'data': _take_rows(encoded_df, pos),
+            'timestamps': _take_rows(timestamps, pos),
+            'segment_ids': _take_rows(segment_ids, pos),
+        }
+        for name, pos in positions.items()
     }
 
     # 정보 출력
     _print_ratio_split_summary(data_dict, split_rate, start_dt, end_dt)
+    if segment_split == 'per_segment':
+        _log_per_segment_split(data_dict)
 
     return data_dict
 
@@ -804,19 +940,34 @@ def _split_trainval_test(encoded_df, timestamps, start_dt, trainval_end, end_dt)
     return trainval_data, trainval_timestamps, test_data, test_timestamps
 
 
-def _split_train_val(trainval_data, trainval_timestamps, train_ratio, val_ratio):
+def _split_trainval_test_segments(timestamps, segment_ids, start_dt, trainval_end, end_dt):
+    """Return segment ids matching _split_trainval_test."""
+    trainval_mask = (timestamps >= start_dt) & (timestamps < trainval_end)
+    test_mask = (timestamps >= trainval_end) & (timestamps <= end_dt)
+    if isinstance(segment_ids, pd.Series):
+        return segment_ids[trainval_mask].to_numpy(), segment_ids[test_mask].to_numpy()
+    trainval_mask = trainval_mask.values if hasattr(trainval_mask, 'values') else trainval_mask
+    test_mask = test_mask.values if hasattr(test_mask, 'values') else test_mask
+    return np.asarray(segment_ids)[trainval_mask], np.asarray(segment_ids)[test_mask]
+
+
+def _split_train_val(trainval_data, trainval_timestamps, train_ratio, val_ratio, trainval_segments=None):
     """2단계 분할: train vs val"""
 
     n_trainval = len(trainval_data)
     train_size = int(n_trainval * train_ratio)
+    if trainval_segments is None:
+        trainval_segments = np.zeros(n_trainval, dtype=int)
 
     # 분할
     train_data = trainval_data[:train_size]
     train_timestamps = trainval_timestamps[:train_size]
+    train_segments = np.asarray(trainval_segments[:train_size])
     val_data = trainval_data[train_size:]
     val_timestamps = trainval_timestamps[train_size:]
+    val_segments = np.asarray(trainval_segments[train_size:])
 
-    return train_data, train_timestamps, val_data, val_timestamps
+    return train_data, train_timestamps, val_data, val_timestamps, train_segments, val_segments
 
 
 def _print_two_stage_split_summary(data_dict, start_dt, trainval_end, end_dt,
@@ -883,34 +1034,27 @@ def _print_two_stage_split_summary(data_dict, start_dt, trainval_end, end_dt,
     logger.info("=" * 75 + "\n")
 
 
-def split_by_ratio(encoded_df, timestamps, split_rate):
+def split_by_ratio(encoded_df, timestamps, split_rate, segment_ids=None, segment_split='global'):
     """
     데이터를 지정된 비율로 train/val/test 분할 (timestamp 포함)
     """
 
-    train_ratio, val_ratio, test_ratio = split_rate
-
     n_samples = len(encoded_df)
-
-    # 분할 인덱스 계산
-    train_size = int(n_samples * train_ratio)
-    val_size = int(n_samples * val_ratio)
+    positions = _ratio_split_positions(n_samples, split_rate, segment_ids, segment_split)
+    if segment_ids is None:
+        segment_ids = pd.Series(np.zeros(n_samples, dtype=int), index=timestamps.index)
 
     # 데이터 분할
     data_dict = {
-        'train': {
-            'data': encoded_df.iloc[:train_size].values,
-            'timestamps': timestamps.iloc[:train_size].values
-        },
-        'val': {
-            'data': encoded_df.iloc[train_size:train_size+val_size].values,
-            'timestamps': timestamps.iloc[train_size:train_size+val_size].values
-        },
-        'test': {
-            'data': encoded_df.iloc[train_size+val_size:].values,
-            'timestamps': timestamps.iloc[train_size+val_size:].values
+        name: {
+            'data': _take_rows(encoded_df, pos),
+            'timestamps': _take_rows(timestamps, pos),
+            'segment_ids': _take_rows(segment_ids, pos),
         }
+        for name, pos in positions.items()
     }
+    if segment_split == 'per_segment':
+        _log_per_segment_split(data_dict)
 
     # 정보 출력
     logger.info("\n" + "=" * 70)

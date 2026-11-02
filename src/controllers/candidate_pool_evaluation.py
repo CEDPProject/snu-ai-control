@@ -13,7 +13,10 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from controllers.action_crossfit import control_episode_ids
-from controllers.evaluation import power_prediction_metrics
+from controllers.evaluation import (
+    power_prediction_metrics,
+    resolve_report_model_refit_rows,
+)
 from controllers.fixed_action_evaluation import FixedActionHoldoutSplit
 from controllers.fixed_action_power_models import FixedActionTotalPowerModel
 
@@ -51,6 +54,7 @@ def _model_arrays(data, rows):
 
 def _fit_parameters(config) -> Dict[str, object]:
     specification = _plain(config)
+    minimum_active_samples = specification.get('hvac_minimum_active_samples')
     return {
         'minimum_action_samples': int(specification['minimum_action_samples']),
         'n_estimators': int(specification['n_estimators']),
@@ -60,6 +64,21 @@ def _fit_parameters(config) -> Dict[str, object]:
         'huber_alpha': float(specification['huber_alpha']),
         'huber_max_iter': int(specification['huber_max_iter']),
         'n_jobs': int(specification['n_jobs']),
+        'input_features': specification.get('input_features'),
+        # Candidate-pool and chronological evaluations must fit an identical
+        # configured report family.  The defaults retain compatibility with
+        # older configs that predate the two-stage HVAC component model.
+        'hvac_low_power_threshold_w': float(
+            specification.get('hvac_low_power_threshold_w', 0.1)
+        ),
+        'hvac_component_name': specification.get('hvac_component_name'),
+        'hvac_minimum_active_samples': (
+            None
+            if minimum_active_samples is None
+            # Preserve the value for FixedActionTotalPowerModel's strict
+            # integer validation; coercing here would accept booleans.
+            else minimum_active_samples
+        ),
     }
 
 
@@ -85,6 +104,25 @@ def _evaluate_model(data, rows, model, minimum_actual_power_w):
     return actual_total, predicted_total, metrics
 
 
+def _evaluate_component_model(data, rows, model, minimum_actual_power_w):
+    """총전력 KPI와 별도로 report model의 성분별 예측을 평가한다."""
+    rows = data.valid_transition_rows(rows)
+    states, controls, disturbances, _, powers = data.model_arrays_for_rows(rows)
+    actual_components = np.asarray(powers, dtype=float)
+    predicted_components = model.predict_components(
+        states,
+        controls,
+        disturbances,
+    )
+    metrics = power_prediction_metrics(
+        actual_components,
+        predicted_components,
+        data.power_names,
+        float(minimum_actual_power_w),
+    )
+    return actual_components, predicted_components, metrics
+
+
 def _select_report_model(
     data,
     *,
@@ -95,6 +133,9 @@ def _select_report_model(
     minimum_actual_power_w,
     target_mape_percent,
     random_state,
+    split_scope_label: str = 'episode-grouped',
+    test_rows=None,
+    refit_scope: str = 'train_validation',
 ):
     specification = _plain(config)
     families = [str(value) for value in specification['candidate_families']]
@@ -142,6 +183,12 @@ def _select_report_model(
                 model,
                 minimum_actual_power_w,
             )
+            _, _, component_metrics = _evaluate_component_model(
+                data,
+                exact_validation_rows,
+                model,
+                minimum_actual_power_w,
+            )
             valid_samples = int(metrics['mape_valid_samples_per_output'][0])
             eligible = bool(
                 metrics['mape_percent'] is not None
@@ -159,6 +206,7 @@ def _select_report_model(
                 'validation_total_power_mape_percent': metrics['mape_percent'],
                 'validation_total_power_wape_percent': metrics['wape_percent'],
                 'validation_total_power_mae_w': metrics['mae_w_per_output'][0],
+                'validation_component_power_prediction': component_metrics,
                 'meets_target': bool(
                     eligible
                     and float(metrics['mape_percent'])
@@ -179,6 +227,7 @@ def _select_report_model(
                 'validation_total_power_mape_percent': None,
                 'validation_total_power_wape_percent': None,
                 'validation_total_power_mae_w': None,
+                'validation_component_power_prediction': None,
                 'meets_target': False,
                 'failure': f'{type(error).__name__}: {error}',
             }
@@ -203,13 +252,12 @@ def _select_report_model(
     for result in results:
         result['selected'] = bool(result is selected)
 
-    combined_training_rows = np.unique(
-        np.concatenate(
-            [
-                data.valid_transition_rows(training_rows),
-                data.valid_transition_rows(validation_rows),
-            ]
-        )
+    combined_training_rows = resolve_report_model_refit_rows(
+        data,
+        training_rows,
+        validation_rows,
+        test_rows=test_rows,
+        scope=refit_scope,
     )
     selected_family = str(selected['model_family'])
     frozen_model = _fit_model(
@@ -222,14 +270,14 @@ def _select_report_model(
     return frozen_model, selected_family, results, {
         'selection_rule': selection_rule,
         'selection_uses_test_targets': False,
-        'selection_training_scope': 'episode-grouped train rows only',
+        'selection_training_scope': f'{split_scope_label} train rows only',
         'selection_scoring_scope': (
-            'pooled exact candidate-action episode-grouped validation rows only'
+            f'pooled exact candidate-action {split_scope_label} validation rows only'
         ),
         'validation_exact_pool_sample_count': int(len(exact_validation_rows)),
         'target_mape_percent': float(target_mape_percent),
         'selected_family': selected_family,
-        'refit_scope': 'episode-grouped train + validation rows',
+        'refit_scope': f'{split_scope_label} train + validation rows',
         'frozen_before_test': True,
         'candidate_families': families,
         'model': frozen_model.to_metadata(),
@@ -244,6 +292,7 @@ def evaluate_fixed_action_candidate_pool_holdout(
     total_power_report_config,
     mape_min_actual_power_w: float,
     random_state: int,
+    report_model_refit_scope: str = 'train_validation',
 ) -> tuple[Dict[str, object], list[Dict[str, object]]]:
     """Evaluate a validation-selected pool of exact observed joint actions."""
     specification = _plain(config)
@@ -261,6 +310,16 @@ def evaluate_fixed_action_candidate_pool_holdout(
         specification['minimum_pooled_test_mape_samples']
     )
     maximum_candidates = int(specification['maximum_candidates'])
+    holdout_protocol = dict(holdout.metadata.get('protocol') or {})
+    split_scope_label = str(
+        holdout_protocol.get(
+            'split_unit',
+            holdout_protocol.get(
+                'episode_definition',
+                'explicit outcome-blind holdout transition',
+            ),
+        )
+    )
     if not 0.0 <= maximum_validation_mape:
         raise ValueError(
             'maximum_validation_mape_percent_per_candidate must be non-negative'
@@ -299,6 +358,12 @@ def evaluate_fixed_action_candidate_pool_holdout(
             selection_model,
             mape_min_actual_power_w,
         )
+        _, _, validation_component_metrics = _evaluate_component_model(
+            data,
+            validation_rows,
+            selection_model,
+            mape_min_actual_power_w,
+        )
         valid_samples = int(
             validation_metrics['mape_valid_samples_per_output'][0]
         )
@@ -330,6 +395,9 @@ def evaluate_fixed_action_candidate_pool_holdout(
                 'validation_total_power_wape_percent': validation_metrics[
                     'wape_percent'
                 ],
+                'validation_component_power_prediction': (
+                    validation_component_metrics
+                ),
                 'eligible_before_pool_limit': not rejection_reasons,
                 'selected_for_pool': False,
                 'rejection_reasons': rejection_reasons,
@@ -371,9 +439,11 @@ def evaluate_fixed_action_candidate_pool_holdout(
         ),
         'candidate_split': holdout.metadata['protocol'],
         'candidate_selection_model': selection_family,
-        'candidate_selection_model_training_scope': 'episode-grouped train only',
+        'candidate_selection_model_training_scope': (
+            f'{split_scope_label} train rows only'
+        ),
         'candidate_selection_score_scope': (
-            'per-action exact-match episode-grouped validation rows only'
+            f'per-action exact-match {split_scope_label} validation rows only'
         ),
         'candidate_selection_metric': 'per-action validation total-power MAPE',
         'maximum_validation_mape_percent_per_candidate': (
@@ -455,6 +525,9 @@ def evaluate_fixed_action_candidate_pool_holdout(
         minimum_actual_power_w=mape_min_actual_power_w,
         target_mape_percent=target_mape_percent,
         random_state=int(random_state) + 100,
+        split_scope_label=split_scope_label,
+        test_rows=holdout.test_rows,
+        refit_scope=report_model_refit_scope,
     )
     test_rows = _union_action_rows(
         data,
@@ -466,6 +539,14 @@ def evaluate_fixed_action_candidate_pool_holdout(
         test_rows,
         report_model,
         mape_min_actual_power_w,
+    )
+    actual_components, predicted_components, pooled_component_metrics = (
+        _evaluate_component_model(
+            data,
+            test_rows,
+            report_model,
+            mape_min_actual_power_w,
+        )
     )
     valid_pooled_samples = int(
         pooled_metrics['mape_valid_samples_per_output'][0]
@@ -490,6 +571,12 @@ def evaluate_fixed_action_candidate_pool_holdout(
             candidate_actual,
             candidate_predicted,
             ('total_hvac_power_w',),
+            float(mape_min_actual_power_w),
+        )
+        candidate_component_metrics = power_prediction_metrics(
+            actual_components[positions],
+            predicted_components[positions],
+            data.power_names,
             float(mape_min_actual_power_w),
         )
         valid_samples = int(
@@ -518,6 +605,7 @@ def evaluate_fixed_action_candidate_pool_holdout(
                     and float(candidate_mape) <= target_mape_percent + 1e-12
                 ),
                 'total_power_prediction': candidate_metrics,
+                'component_power_prediction': candidate_component_metrics,
             }
         )
         for position, row_index in zip(positions, candidate_rows):
@@ -544,6 +632,12 @@ def evaluate_fixed_action_candidate_pool_holdout(
                             data.power_names,
                             data.powers[int(row_index)],
                         )
+                    },
+                    **{
+                        f'predicted_{name}': float(
+                            predicted_components[position, output]
+                        )
+                        for output, name in enumerate(data.power_names)
                     },
                     'actual_total_hvac_power_w': actual_value,
                     'predicted_total_hvac_power_w': predicted_value,
@@ -607,6 +701,7 @@ def evaluate_fixed_action_candidate_pool_holdout(
         'all_selected_actions_reportable': all_actions_reportable,
         'primary_metric': primary_metric,
         'total_power_prediction': pooled_metrics,
+        'component_power_prediction': pooled_component_metrics,
         'equal_action_macro_mape_percent': macro_mape,
         'worst_action_mape_percent': worst_mape,
         'action_target_pass_rate_percent': action_pass_rate,
@@ -644,6 +739,7 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
     total_power_report_config,
     mape_min_actual_power_w: float,
     random_state: int,
+    report_model_refit_scope: str = 'train_validation',
 ) -> tuple[Dict[str, object], list[Dict[str, object]]]:
     """Evaluate every cumulative validation-ranked Top-K pool with one model.
 
@@ -731,6 +827,12 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
             selection_model,
             mape_min_actual_power_w,
         )
+        _, _, validation_component_metrics = _evaluate_component_model(
+            data,
+            validation_rows,
+            selection_model,
+            mape_min_actual_power_w,
+        )
         valid_samples = int(
             validation_metrics['mape_valid_samples_per_output'][0]
         )
@@ -759,6 +861,9 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
             'selection_validation_total_power_mape_percent': validation_mape,
             'selection_validation_total_power_wape_percent': (
                 validation_metrics['wape_percent']
+            ),
+            'selection_validation_component_power_prediction': (
+                validation_component_metrics
             ),
             'eligible': not rejection_reasons,
             'rejection_reasons': rejection_reasons,
@@ -821,6 +926,8 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
         minimum_actual_power_w=mape_min_actual_power_w,
         target_mape_percent=target_mape_percent,
         random_state=int(random_state) + 100,
+        test_rows=holdout.test_rows,
+        refit_scope=report_model_refit_scope,
     )
     selected_validation_result = next(
         result for result in model_validation_results if result['selected']
@@ -855,12 +962,32 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
             validation_model,
             mape_min_actual_power_w,
         )
+        (
+            validation_actual_components,
+            validation_predicted_components,
+            validation_component_metrics,
+        ) = _evaluate_component_model(
+            data,
+            validation_rows,
+            validation_model,
+            mape_min_actual_power_w,
+        )
         test_rows = _exact_action_rows(
             data,
             holdout.test_rows,
             control,
         )
         test_actual, test_predicted, test_metrics = _evaluate_model(
+            data,
+            test_rows,
+            frozen_report_model,
+            mape_min_actual_power_w,
+        )
+        (
+            test_actual_components,
+            test_predicted_components,
+            test_component_metrics,
+        ) = _evaluate_component_model(
             data,
             test_rows,
             frozen_report_model,
@@ -878,10 +1005,16 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
             'validation_rows': validation_rows,
             'validation_actual': validation_actual,
             'validation_predicted': validation_predicted,
+            'validation_actual_components': validation_actual_components,
+            'validation_predicted_components': validation_predicted_components,
+            'validation_component_metrics': validation_component_metrics,
             'test_rows': test_rows,
             'test_actual': test_actual,
             'test_predicted': test_predicted,
+            'test_actual_components': test_actual_components,
+            'test_predicted_components': test_predicted_components,
             'test_metrics': test_metrics,
+            'test_component_metrics': test_component_metrics,
             'test_action_reportable': test_action_reportable,
         })
         candidate_order.append({
@@ -893,7 +1026,11 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
             'report_model_validation_valid_sample_count': int(
                 validation_metrics['mape_valid_samples_per_output'][0]
             ),
+            'report_model_validation_component_power_prediction': (
+                validation_component_metrics
+            ),
             'test_total_power_mape_percent': test_metrics['mape_percent'],
+            'test_component_power_prediction': test_component_metrics,
             'test_valid_mape_sample_count': test_valid_samples,
             'test_action_reportable': test_action_reportable,
         })
@@ -921,6 +1058,12 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
                         data.power_names,
                         data.powers[int(row_index)],
                     )
+                },
+                **{
+                    f'predicted_{name}': float(
+                        test_predicted_components[position, output]
+                    )
+                    for output, name in enumerate(data.power_names)
                 },
                 'actual_total_hvac_power_w': actual_value,
                 'predicted_total_hvac_power_w': predicted_value,
@@ -958,6 +1101,18 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
             ('total_hvac_power_w',),
             float(mape_min_actual_power_w),
         )
+        validation_component_metrics = power_prediction_metrics(
+            np.concatenate(
+                [item['validation_actual_components'] for item in prefix],
+                axis=0,
+            ),
+            np.concatenate(
+                [item['validation_predicted_components'] for item in prefix],
+                axis=0,
+            ),
+            data.power_names,
+            float(mape_min_actual_power_w),
+        )
         validation_valid_samples = int(
             validation_metrics['mape_valid_samples_per_output'][0]
         )
@@ -979,6 +1134,18 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
             test_actual,
             test_predicted,
             ('total_hvac_power_w',),
+            float(mape_min_actual_power_w),
+        )
+        test_component_metrics = power_prediction_metrics(
+            np.concatenate(
+                [item['test_actual_components'] for item in prefix],
+                axis=0,
+            ),
+            np.concatenate(
+                [item['test_predicted_components'] for item in prefix],
+                axis=0,
+            ),
+            data.power_names,
             float(mape_min_actual_power_w),
         )
         test_valid_samples = int(
@@ -1016,6 +1183,7 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
             'validation_pooled_wape_percent': validation_metrics[
                 'wape_percent'
             ],
+            'validation_component_power_prediction': validation_component_metrics,
             'validation_reportable': validation_reportable,
             'validation_target_achieved': bool(
                 validation_reportable
@@ -1031,6 +1199,7 @@ def evaluate_fixed_action_candidate_pool_top_k_sweep(
             'test_valid_mape_sample_count': test_valid_samples,
             'test_pooled_mape_percent': test_mape,
             'test_pooled_wape_percent': test_metrics['wape_percent'],
+            'test_component_power_prediction': test_component_metrics,
             'test_reportable': test_reportable,
             'test_target_achieved': bool(
                 test_reportable

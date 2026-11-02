@@ -89,7 +89,7 @@ report_dir="${OUTPUT_DIR}/${data_version}"
 artifact_path="${report_dir}/artifact.json"
 html_path="${report_dir}/forecasting_report.html"
 
-default_builder=""
+default_builder=""  # 선택: HTML 변환기(deliver_portable_artifact.mjs) 경로
 builder="${PORTABLE_REPORT_BUILDER:-${default_builder}}"
 if command -v node >/dev/null 2>&1 && [[ -f "${builder}" ]]; then
   delivery_output="$(node "${builder}" --input "${artifact_path}" --output "${html_path}")"

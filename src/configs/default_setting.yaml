@@ -18,6 +18,21 @@ DATASET:
   drop_last: false
   environment_name: livingroom
   data_version: version3_260714_processed
+  # Optional multi-version dataset. Keep null for the legacy single-version
+  # path. When set, this list is authoritative, e.g.
+  # [version3_260714_processed, version4_260805_processed].
+  data_versions: null
+  # Multiple versions are concatenated as separate chronological segments, not
+  # as one continuous time series.
+  merge_strategy: segmented_concat
+  # Forecast samples whose seq_len+pred_len would cross a segment boundary are
+  # excluded. MPC transition masks also require the same segment.
+  prevent_cross_segment_windows: true
+  # Ratio split of a multi-version dataset (forecast only, requires split_date=null).
+  # global: cut the concatenated table once (test = tail of the last version).
+  # per_segment: cut each version with split_rate, then join train/val/test pieces
+  # (test = union of each version's own test tail).
+  segment_split: global
   seq_len: 120
   stride_len: 1
   pred_len: 60
@@ -114,9 +129,10 @@ MPC:
     fail_on_low_quality: false
 
   # MPC 최적화에 쓰는 affine 모델과 분리된 offline 평가용 plant surrogate다.
-  # 기본값은 기존 ExtraTrees이며 model_family를 바꿀 때만 다른 모델을 학습한다.
+  # 기본값은 전력 성분을 분리한 two-stage HVAC evaluator다. 기존 ExtraTrees
+  # family도 evaluator_benchmark에서 같은 validation protocol로 비교한다.
   independent_evaluator:
-    model_family: extra_trees_residual_state
+    model_family: component_two_stage_hvac
     # 추가 후보는 train-only 학습 후 동일 validation protocol로만 비교한다.
     # 예: [random_forest_residual_state, neural_residual, 'forecasting:DLinear']
     validation_model_families: []
@@ -131,6 +147,17 @@ MPC:
     max_iter: 100
     # recursive step에서 작은 batch를 반복하므로 thread overhead를 피한다.
     n_jobs: 1
+
+    # component_two_stage_hvac을 선택했을 때만 쓰는 분리 전력 설정이다.
+    # 환기 전력은 독립 ExtraTrees로, 냉난방 전력은
+    # P(active | x,z,d) × E[power | active,x,z,d]로 예측한다. 과거 run을
+    # 재현해야 하면 model_family를 extra_trees_residual_state로 명시하면 된다.
+    component_power:
+      # 이 값 이하의 냉난방유효전력(W)을 OFF/저전력 class로 본다.
+      hvac_active_threshold_w: 0.1
+      # 자동 이름 추론이 모호한 데이터셋에서도 HVAC 출력이 바뀌지 않도록
+      # 명시한다. null이면 냉난방/hvac 계열 이름 토큰으로 단 하나를 추론한다.
+      hvac_component_name: 냉난방유효전력(W)
 
     # 독립 Ridge baseline의 상태·전력 오차를 MLP가 보정한다. MPC의 affine
     # 계수를 재사용하지 않으므로 최적화 모델과 평가 모델의 분리를 유지한다.
@@ -178,6 +205,7 @@ MPC:
   evaluator_benchmark:
     model_families:
       - extra_trees_residual_state
+      - component_two_stage_hvac
       - random_forest_residual_state
       - hist_gradient_boosting_residual_state
       - neural_residual
@@ -258,6 +286,25 @@ MPC:
           minimum_validation_samples_per_candidate: 1
         candidate_pool_overrides:
           minimum_validation_mape_samples_per_candidate: 1
+      # provisional 전용 초완화 시나리오 — v3/v5처럼 support가 희소해 strict가 null이
+      # 되는 데이터에서도 진단용 값이 나오게 한다. train/validation/test 최소 1개까지
+      # 허용한다. 절대 공식 KPI로 쓰지 않는다(classification=provisional_only).
+      - name: relaxed_minimal_60
+        description: provisional 전용 초완화 평가 — train/validation/test 최소 1 episode·1 sample까지 허용
+        classification: provisional_only
+        maximum_validation_mape_percent_per_candidate: 100.0
+        maximum_candidates: 60
+        holdout_overrides:
+          minimum_training_samples_per_candidate: 1
+          minimum_training_episodes_per_candidate: 1
+          minimum_validation_samples_per_candidate: 1
+          minimum_validation_episodes_per_candidate: 1
+          minimum_test_exact_matches: 1
+          minimum_test_episodes_per_candidate: 1
+        candidate_pool_overrides:
+          minimum_validation_mape_samples_per_candidate: 1
+          minimum_test_mape_samples_per_candidate: 1
+          minimum_pooled_test_mape_samples: 30
 
 
   # Train 3 / Validation 1 / Test 5 support를 만족하는 최대 41개 후보를
@@ -285,9 +332,185 @@ MPC:
       minimum_pooled_test_mape_samples: 30
       maximum_candidates: 41
 
+  # strict 공식 KPI와 완화(relaxed) provisional 값을 coverage·신뢰등급과 함께
+  # 하나의 요약으로 저장한다. strict의 의미는 그대로 유지하고, provisional은 절대
+  # 공식값으로 승격하지 않는다(claim_boundary=diagnostic_only_not_official_kpi).
+  # 목적: support가 부족해 strict가 null이 되는 run도 "실패"로 끝내지 않고,
+  #       완화 조건에서의 값·coverage·신뢰등급을 남겨 해석 가능하게 한다.
+  # 성분별(환기/냉난방)·총전력 전력예측을 설정 가능한 floor로 MAPE/WAPE 계산하고
+  # target(≤1.95%) pass/fail을 판정한다(방안 2: 지표 조정). 실제 action·MPC action
+  # 예측을 모두 판정한다. 냉난방은 near-zero(≤1W)가 절반 이상이라 MAPE 분모가
+  # 폭발하므로, floor로 near-zero를 제외하거나 WAPE(간헐부하 표준)로 함께 판정한다.
+  # 이 값은 report model의 전력예측 정확도이며 MPC 절감/제어 성능이 아니다.
+  component_kpi_gate:
+    enabled: true
+    target_percent: 1.950
+    mape_floor_w: 5.0
+
+  # 환기-격리 KPI: 냉난방 입력을 배제한 환기-전용 예측기로 환기 전력을 예측해,
+  # MPC의 냉난방 변경에 불변인(견고한) 환기 MAPE/WAPE를 산출한다. counterfactual
+  # 산출물을 입력으로 받는 additive 평가로, 기존 경로/수치를 바꾸지 않는다.
+  # recorded_action은 전체 test에서, mpc_action은 MPC가 환기 sub-action을 유지한
+  # 행(실제값 유효)에서만 실제-대조하며 커버리지를 함께 공개한다.
+  vent_isolated_kpi:
+    enabled: true
+    target_percent: 1.950
+    mape_floor_w: 5.0
+
+  provisional_kpi_summary:
+    enabled: true
+    target_mape_percent: 1.950
+    provisional:
+      # candidate_pool_experiments 시나리오 중 완화된 것들만 provisional 후보로 본다.
+      include_scenarios:
+        - expanded_9
+        - expanded_10
+        - expanded_12
+        - expanded_13
+        - expanded_17
+        - exploratory_41
+        - relaxed_minimal_60
+      # 목표(target) 통과 시나리오 중 coverage가 가장 큰 값을 대표로 선택한다.
+      # 통과가 없으면 reportable 중 MAPE 최저값을 진단용으로 선택한다.
+      selection_rule: target_pass_highest_coverage
+      fallback_rule: lowest_mape_diagnostic
+    confidence_tiers:
+      high:
+        minimum_coverage_percent: 40.0
+        minimum_sample_count: 5000
+      medium:
+        minimum_coverage_percent: 20.0
+        minimum_sample_count: 1000
+
+  # report model만 공정하게 비교하는 입력 ablation이다. MILP를 다시 풀지 않고,
+  # 시간순 train/validation/test에서 기록 action의 component별 MAPE를 산출한다.
+  # 따라서 이 task는 controller policy 성능이 아니라 report-model 예측 성능 비교다.
+  report_model_input_ablation:
+    # 각 입력 case에서 기존 발표 표와 같은 candidate-pool 확장 결과를 함께
+    # 저장한다. 공통 outcome-blind episode-group holdout에서 validation MAPE 순위로
+    # candidate를 누적하여 7→9→…개를 실제로 확장한다. 총전력 pooled MAPE가 판정
+    # 기준이고, 환기·냉난방 component MAPE는 같은 고정 report model의 보조 결과다.
+    candidate_pool_expansion:
+      enabled: true
+      # 41개 후보를 만들기 위해 test support를 1행까지 완화한 exploratory
+      # sensitivity holdout이다. 따라서 아래 K prefix의 test 값 중
+      # selected_by_validation=true인 한 K만 공식 선택이고, 나머지는 모두
+      # sensitivity-only로 표시한다.
+      holdout_overrides:
+        minimum_training_samples_per_candidate: 3
+        minimum_validation_samples_per_candidate: 1
+        minimum_test_exact_matches: 1
+      candidate_pool_overrides:
+        maximum_validation_mape_percent_per_candidate: 100.0
+        minimum_validation_mape_samples_per_candidate: 1
+        minimum_test_mape_samples_per_candidate: 1
+        minimum_pooled_test_mape_samples: 30
+      minimum_pooled_validation_mape_samples: 1
+      # 세 MAPE를 독립적으로 판정한다. by_power_output에 특정 전력명을
+      # 넣으면 default_component_mape_percent 대신 해당 목표값을 쓴다.
+      metric_targets:
+        total_power_mape_percent: 1.950
+        default_component_mape_percent: 1.950
+        by_power_output: {}
+        # component MAPE 분모(|y| > 0.1 W)를 만족한 최소 표본 수다.
+        minimum_component_mape_samples: 1
+      # label은 기존 슬라이드의 읽기 방식에 맞춘 표시명이다. 이번 run의
+      # previous_7은 과거 run을 재현한다는 뜻이 아니라 validation-ranked Top-7
+      # prefix를 뜻한다.
+      top_k_prefixes:
+        - label: previous_7
+          k: 7
+        - label: expanded_9
+          k: 9
+        - label: expanded_10
+          k: 10
+        - label: expanded_12
+          k: 12
+        - label: expanded_13
+          k: 13
+        - label: expanded_17
+          k: 17
+        - label: exploratory_41
+          k: 41
+    cases:
+      - name: state_action_disturbance
+        description: 현재 상태 + 제어 action + 현재 외란
+        input_features:
+          current_state: true
+          action: true
+          current_disturbance: true
+      - name: state_action
+        description: 현재 상태 + 제어 action
+        input_features:
+          current_state: true
+          action: true
+          current_disturbance: false
+      - name: action_only
+        description: 제어 action만
+        input_features:
+          current_state: false
+          action: true
+          current_disturbance: false
+
+  # 이미 완료된 MPC run의 first-action을 그대로 재사용해, report model 입력만
+  # 바꾸는 반사실적 ablation이다. MILP를 다시 풀지 않으므로 세 case의 행·state·
+  # MPC action은 완전히 같고 report model의 입력 정보만 다르다.
+  counterfactual_report_input_ablation:
+    # 기본 MPC는 06 Full guard 설정으로 실행한 뒤, 저장된 MPC first-action을
+    # 그대로 재사용해 아래 세 report-model 입력 묶음을 모두 평가한다. MILP는
+    # 다시 풀지 않으므로 세 case의 row·state·disturbance·MPC action trace는 같다.
+    # false는 smoke test처럼 시간이 제한된 경우에만 사용한다.
+    run_after_mpc: true
+    # 실행 시 반드시 명시한다. 해당 경로에는 mpc_evaluation.json과
+    # mpc_counterfactual_total_power_report_predictions.csv가 있어야 한다.
+    # run_after_mpc=true면 mpc runner가 방금 완료한 결과 경로로 자동 설정한다.
+    reference_mpc_result_dir: null
+
   objective:
     # one-hot 변화량의 L1 비용. 불필요하게 잦은 switching을 억제한다.
     switch_penalty: 0.05
+    # 한 계획 step에서 직전 action과 달라질 수 있는 categorical 제어변수 수의
+    # hard upper bound다. 3이면 예를 들어 환기 풍량·환기 모드·냉난방 전원만
+    # 동시에 바꿀 수 있다. null이면 기존처럼 penalty만 적용한다.
+    # 첫 action은 매 분 다시 최적화되므로, 과도한 한 번의 설정 점프를 줄이는
+    # 보수적 기본값으로 둔다. 너무 많은 fallback이 기록되면 null/4 이상으로
+    # 완화하고 diagnostics CSV에서 그 근거를 먼저 확인한다.
+    maximum_changed_control_variables_per_step: 3
+    # 최근 실제 적용 action의 이력을 함께 고려하는 선택형 regularizer다.
+    # enabled=true면 z_t를 t-1, ..., t-L action과 비교하되, closed-loop에서는
+    # window 시작 전 구간만 기록 action으로 bootstrap하고 이후에는 이전 MPC
+    # 적용 action만 누적한다. 따라서 미래 기록 action을 읽지 않는다.
+    # 기본 MPC의 재현성을 보존하기 위해 기본값은 false이며, 아래 값은
+    # run_history_smoothed_mpc.sh 또는 명시적 --opts에서 활성화한다.
+    action_history:
+      enabled: false
+      lookback_steps: 5
+      # lag 1, 2, 3, 4, 5분 순서. 가장 최근 action과의 차이를 가장 크게 본다.
+      recency_weights: [1.0, 0.8, 0.6, 0.4, 0.2]
+      # 위 가중 Hamming distance의 목적함수 계수. 전력/상태 목적과 함께
+      # 최적화되는 soft penalty이므로 급격한 변경을 완전히 금지하지는 않는다.
+      penalty: 0.5
+      # recent-window의 변화량은 raw one-hot bit가 아니라 장비 설정 묶음으로
+      # 센다. OFF canonicalization으로 부수 category가 같이 바뀌는 것을 하나의
+      # 장비 조작으로 해석하기 위함이다.
+      groups:
+        - name: ventilation
+          variables: [환기전원, 환기풍량, 환기운전모드]
+        - name: hvac
+          variables: [냉난방전원, 냉난방풍량, 냉난방운전모드, 냉난방설정온도(℃)]
+      # 최근 5개 과거 action 사이의 변화 4회와 새 first action 변화 1회의
+      # 장비 단위 합계 budget이다. null이면 history penalty만 쓴다. 값 3은
+      # 5분 창 안에서 장비 설정 묶음 변경을 총 3회까지 선호하도록 한다.
+      rolling_change_budget: 3
+      # 선택적으로 history group마다 독립적인 rolling budget을 추가한다.
+      # groups: null이면 group 이름은 7개 개별 제어변수명이다. 예를 들어
+      # {환기전원: 0, 환기풍량: 1}은 해당 두 변수의 recent-window 변경을
+      # 각각 제한한다. 지정하지 않은 group은 aggregate budget/penalty만 따른다.
+      # null은 기존 장비 묶음 단일 budget 동작을 그대로 보존한다.
+      per_group_rolling_change_budgets: null
+      # budget이 이미 과거 이력만으로 초과된 경우에도 MILP infeasible을
+      # 피하도록 두는 비음수 slack의 큰 penalty다. overflow는 CSV에 감사한다.
+      rolling_budget_slack_penalty: 100.0
   solver:
     time_limit_seconds: 60.0
     mip_relative_gap: 0.01
@@ -300,6 +523,12 @@ MPC:
     lead_time_steps: [1, 10, 30, 60]
     primary_baseline: recorded
     restrict_to_training_control_support: true
+    # frozen report model을 다시 학습할 데이터 범위.
+    #  - train_validation(기본): train+validation으로 학습하고 test는 채점만
+    #    (held-out test 오차 추정 = KPI를 신뢰할 수 있는 유일한 설정).
+    #  - train_validation_test: 배포용 instrument로 test까지 학습. 이 경우 test에서
+    #    잰 MAPE/WAPE는 누수된 값이라 일반화 KPI로 쓸 수 없음(진단/배포 전용).
+    report_model_refit_scope: train_validation
     minimum_policy_windows: 20
     bootstrap_samples: 2000
     bootstrap_confidence: 0.95
@@ -330,6 +559,66 @@ MPC:
       # train 및 평가 episode 개수만 탈락 조건에서 제외한다.
       exclude_insufficient_episode_actions:
         enabled: true
+
+    # 정적 candidate pool(반복 관측 train action)보다 한 단계 더 엄격한
+    # first-action 신뢰도 gate다. 각 시점의 현재 state+disturbance 주변에서
+    # train 관측이 충분한 exact action만 MILP의 z_0으로 허용한다.
+    # 거리 임계값은 validation의 x,d,recorded action으로만 q95 보정하며,
+    # validation/test power 또는 다음 state target을 보지 않는다.
+    action_trust:
+      enabled: true
+      global_support:
+        minimum_samples: 30
+        minimum_episodes: 3
+      local_context_support:
+        enabled: true
+        minimum_samples_within_radius: 3
+        # q95 거리 한계를 보정하기에 필요한 action-matched validation context
+        # 수다. 이보다 적으면 임의의 수치로 local gate를 강제하지 않고 global
+        # support + independent-model screen만 적용하며 그 이유를 기록한다.
+        minimum_validation_contexts: 30
+        maximum_standardized_rms_distance: null
+        neighbor_count: 5
+        maximum_mean_k_distance: null
+        calibration_quantile: 0.95
+
+    # controller affine 모델이 특정 저전력 action을 과도하게 낙관하는 것을
+    # 막기 위한 independent-evaluator screen이다. train-only evaluator를
+    # validation에 적용해 component 전력 불일치 및 state 잔차 여유를 보정한
+    # 뒤, 현재 시점의 후보 z_0에만 적용한다. sequence evaluator처럼 stateless
+    # preview가 불가능한 경우에는 monitor로 기록하고 후보를 자동 탈락시키지
+    # 않는다. reject로 바꾸면 보수적으로 모두 제외할 수 있다.
+    action_model_screen:
+      enabled: true
+      unavailable_model_policy: monitor
+      power_disagreement:
+        enabled: true
+        power_floor_w: 1.0
+        calibration_quantile: 0.95
+        maximum_normalized_component_disagreement: null
+      state_safety:
+        enabled: true
+        calibration_quantile: 0.95
+        # reject: 다음 상태 예측이 여유폭 적용 범위 밖이면 기각(원본).
+        # non_worsening: 모든 후보가 범위 밖일 때만, 이전 action 유지보다
+        #   상태별 예측 위반이 커지지 않는 후보를 허용(fallback 완화 ablation).
+        out_of_band_policy: reject
+
+    # 동결된 report model을 이용해, 현 시점의 기준 action에서 지나치게 큰
+    # 전력 변화가 예측되는 z_0 후보를 MILP 풀이 전에 제거한다. 이 gate는
+    # report(MPC)↔report(recorded) 변화량을 제한하는 안전장치이며, 실제
+    # test 전력·절감률·MAPE는 어떤 방식으로도 후보 선택에 사용하지 않는다.
+    # 기본값은 비활성이다. 실험 runner가 validation에서 미리 정한 limit만
+    # 켜서 사용한다.
+    report_action_effect_gate:
+      enabled: false
+      # 모델 오류로 예측을 만들 수 없을 때 reject는 보수적으로 해당 후보를
+      # 제외하고, monitor는 제외하지 않되 audit에 사유를 남긴다.
+      unavailable_model_policy: reject
+      minimum_reference_power_w: 0.1
+      # null이면 해당 축의 변화량 제한을 사용하지 않는다.
+      maximum_total_relative_change_percent: null
+      maximum_component_relative_change_percent: null
 
     # 시간 순서는 유지하되 동일 joint-action episode가 두 split에 걸치지 않도록
     # 아래 기준으로 split support를 감사한다. 데이터를 복제하거나 미래 행을
@@ -377,11 +666,30 @@ MPC:
           냉난방전원: 'ON'
         maximum_state_satisfaction_loss_percent: 1.0
 
-      # 공식 MAPE 계산에만 쓰는 direct total-power report model이다.
+      # 공식 MAPE 계산에만 쓰는 component-aware total-power report model이다.
       # MPC/MILP의 affine power model, 목적함수, 제약, action 선택에는 연결하지 않는다.
       total_power_report_model:
         enabled: true
         target_mape_percent: 1.950
+        # Report model 입력 묶음은 독립적으로 선택한다. 모두 false이면 학습을
+        # 중단한다. action=false이면 MPC action 변경에 따른 전력 차이는 0이므로
+        # 반사실적 제어 효과를 해석할 수 없다.
+        input_features:
+          current_state: true
+          action: true
+          current_disturbance: true
+        # factual report prediction 보정은 test 이전의 chronological 내부
+        # holdout으로만 학습한다. 기본 none은 기존 결과 재현용이다.
+        # inner_train_component_affine은 각 성분에 대해
+        # actual ~= slope * raw_report + intercept을 학습한 뒤,
+        # slope 범위 안에서만 보정한다. validation은 family 선택용, test는
+        # 최종 평가 전용으로 남는다.
+        post_calibration:
+          method: none
+          inner_holdout_fraction: 0.15
+          minimum_samples_per_component: 30
+          minimum_slope: 0.25
+          maximum_slope: 4.0
         # 목표를 통과한 모델 중 가장 단순한 family를 사용한다. 목표를 통과한
         # family가 없을 때만 validation MAPE가 가장 낮은 family로 fallback한다.
         selection_rule: simplest_within_target
@@ -393,6 +701,10 @@ MPC:
           - action_median_huber_residual
           - action_median_extra_trees_residual
           - direct_total_extra_trees
+          # 환기 component는 직접 회귀, 냉난방 component는 OFF/ON 확률과
+          # ON 조건부 전력을 분리해 예측한다. 기존 family와 동일 validation
+          # 절차에서만 선택되며, MILP의 목적함수에는 사용하지 않는다.
+          - component_hvac_two_stage_extra_trees
         minimum_validation_mape_samples: 3
         # action별 baseline은 이 표본 수 이상일 때만 사용하고, 부족하거나 처음
         # 보는 action은 train 전체 중앙값으로 fallback한다.
@@ -401,11 +713,18 @@ MPC:
         huber_epsilon: 1.35
         huber_alpha: 0.0001
         huber_max_iter: 500
-        # residual/direct ExtraTrees 공통 설정이다.
+        # residual/direct ExtraTrees 공통 설정이다. 모든 family는 환기·냉난방
+        # component를 예측하고 총전력은 그 합으로 산출한다.
         n_estimators: 300
         min_samples_leaf: 3
         max_features: 1.0
         n_jobs: 1
+        # component_hvac_two_stage_extra_trees 전용. 냉난방 meter 이름이
+        # 여러 개여서 자동 식별이 모호한 데이터에서만 component_name을 쓴다.
+        hvac_low_power_threshold_w: 0.1
+        hvac_component_name: 냉난방유효전력(W)
+        # null이면 minimum_action_samples를 ON-조건부 회귀의 최소 표본으로 쓴다.
+        hvac_minimum_active_samples: null
 
     # 공식 KPI는 validation MAPE 기준으로 고정한 여러 exact joint action의
     # test 행을 합쳐 표준 sample-level MAPE로 계산한다. 단일 최적 action 평가는
@@ -423,6 +742,20 @@ MPC:
       # 0이면 validation 기준을 통과한 후보를 모두 공식 pool에 포함한다.
       maximum_candidates: 0
 
+    # 보조 실험: exact joint action별 행을 8:1:1로 층화 배치한다. 같은 action의
+    # 연속 episode가 여러 split에 나뉠 수 있으므로 미래시점·독립 episode 일반화
+    # 또는 strict 공식 KPI로 해석하지 않는다. 모든 유효 행을 한 번씩 배치하므로
+    # 후보가 아닌 희소 action도 coverage 분모에는 남는다.
+    action_stratified_row_evaluation:
+      enabled: true
+      # null이면 DEFAULT.seed를 사용한다. action별 seed를 고정해 재실행 시
+      # 동일한 split을 재현한다.
+      random_state: null
+      # 기본 fixed holdout과 fixed candidate-pool의 support·validation gate를
+      # 그대로 쓴다. 필요할 때만 이 두 override로 명시적으로 바꾼다.
+      holdout_overrides: {}
+      candidate_pool_overrides: {}
+
     # 실제 장비에 새 제어를 적용할 수 없으므로, validation에서 실제 관측된
     # 공동 제어 조합만 후보로 삼고 test의 동일 조합 실제 Y로 MAPE를 계산한다.
     # 이전 시간순 민감도 분석용으로만 유지하며, 공식 대표값은 위
@@ -433,6 +766,33 @@ MPC:
       minimum_predicted_state_satisfaction_percent: 80.0
       minimum_test_exact_matches: 30
       minimum_test_mape_samples: 30
+
+    # 기록 test의 현재 상태·외란마다 MILP가 새 first action을 고르게 한 뒤, 하나의
+    # 고정 total-power report model에 아래 두 입력을 모두 넣는다.
+    # (1) (recorded state, recorded action, recorded disturbance) ↔ 기록 실제 전력:
+    #     MPC action 예측과 기록 실제 전력의 MAPE(변경 action의 actual-Y MAPE는 아님).
+    # (2) (recorded state, MPC action, recorded disturbance) ↔ (1)의 report 예측값:
+    #     state·외란·model을 고정하고 action만 바꾼 report-to-report MAPE 및
+    #     모델 기반 예상 절감률. 실제 장비 절감률 또는 forecast accuracy는 아님.
+    mpc_counterfactual_total_power_report:
+      enabled: true
+      target_mape_percent: 1.950
+      minimum_validation_mape_samples: 30
+      minimum_test_mape_samples: 30
+      # 일반 MPC policy와 동일하게 선택된 60분 test window에 포함된 모든 유효
+      # transition을 사용한다. 1이면 모든 행, 양수면 일정 간격으로 표본화한다.
+      row_stride_steps: 1
+      # 0이면 표본화 후 모든 행을 사용한다. 실행 시간을 제한해야 할 때만 양수.
+      maximum_evaluation_rows: 0
+      # 기본 counterfactual 평가는 직전 기록 action을 first-action switching
+      # 기준으로 쓴다. recorded_current_action은 같은 시점의 기록 action을
+      # 기준으로 삼는 offline action-distance 진단 전용이다. 실제 배포 정책의
+      # 미래 action으로 해석하면 안 된다.
+      first_action_reference: recorded_previous_action
+      # policy_windows는 선택된 MPC window의 행만 평가한다. all_chronological_test는
+      # 시간순 test의 모든 유효 transition을 쓰며 action-distance K=0에서
+      # observed-action report-model 평가와 동일 cohort를 만들기 위해 사용한다.
+      evaluation_row_scope: policy_windows
 
     # MPC가 폐루프 평가에서 실제로 선택한 모든 joint action의 실제-Y 예측
     # MAPE를 측정한다. 각 fold는 과거 데이터로만 학습하며 fold 안에서는
@@ -454,6 +814,58 @@ MPC:
       minimum_fold_training_episodes_per_action: 3
       # 이 기준 미만이면 부분 MAPE는 diagnostic으로만 남기고 대표값은 null이다.
       minimum_reportable_mpc_step_coverage_percent: 30.0
+
+  # Full guard MPC가 기록된 현재 action에서 얼마나 벗어날 수 있는지를 K=0..7로
+  # sweep하는 offline action-distance 실험의 설정이다. 각 K의 저장된 MPC action
+  # trace에는 세 report-model 입력 bundle을 모두 적용한다. 이 설정은 일반 mpc
+  # task에는 사용되지 않고 action_distance_ablation task에서만 읽는다.
+  action_distance_ablation:
+    distances: [0, 1, 2, 3, 4, 5, 6, 7]
+    first_action_reference: recorded_current_action
+    evaluation_row_scope: all_chronological_test
+    # action-distance 표의 본체는 모든 시간순 test 행의 first-action 진단이다.
+    # 별도 60분 closed-loop 품질 보고는 K마다 한 window만 저장해 중복 비용을
+    # 제한한다. 이 값은 action-distance MAPE의 test cohort를 줄이지 않는다.
+    closed_loop_max_windows: 1
+    # 07 observed-action ablation과 같은 component family/seed 규칙으로 세
+    # 입력 bundle을 비교해 K=0을 직접적인 factual 기준선으로 재현한다.
+    report_model_candidate_families:
+      - component_hvac_two_stage_extra_trees
+
+  # L=0은 현재 기록 action을 그대로 고정한 factual 기준선이며, L>0은 현재
+  # action을 새로 고르되 직전 L분 applied action 이력으로 급격한 변경을
+  # 억제하는 Full-guard MPC sweep이다. 모든 scenario에 대해 동일한 시간순
+  # test first-action trace와 세 report-model 입력 bundle을 저장한다.
+  action_history_ablation:
+    lookback_steps: [0, 1, 2, 5, 10, 30]
+    # L>0 scenario의 first action에 적용할 categorical hard distance K다.
+    # [7]/equipment/[0.5]는 이전 L-sweep의 재현 가능한 기본값이다. K=1,2와
+    # 개별 제어변수 history를 실험할 때는 CLI에서 아래 matrix 값을 바꾼다.
+    hard_distances: [7]
+    history_group_modes: [equipment]
+    history_penalties: [0.5]
+    evaluation_row_scope: all_chronological_test
+    # 0은 가능한 모든 60분 closed-loop window를 뜻한다. counterfactual MAPE
+    # cohort는 이 값과 독립적으로 시간순 test의 모든 유효 transition이다.
+    closed_loop_max_windows: 0
+    # 가장 최근(lag 1)부터 오래된(lag L) 순 exponential weights다. 모든 L에서
+    # 합을 3.0으로 정규화하여 history 길이만 달라지고 penalty 총량은 같다.
+    recency_weight_decay: 0.8
+    recency_weight_total: 3.0
+    # L=5의 기존 설정(장비 묶음 변화 3회)을 기준 rate로 삼아 L에 비례해
+    # ceiling으로 확장한다: L=1,2,5,10,30 -> 1,2,3,6,18. null이면
+    # aggregate budget을 끄고 아래 per-group budget만 적용한다.
+    rolling_change_budget_reference_steps: 5
+    rolling_change_budget_reference_value: 3
+    # mode별 개별 group budget의 L=5 기준값이다. null이면 group별 독립 budget을
+    # 추가하지 않는다. per_control_variable mode에서는 key가 정확한 제어변수명이다.
+    # 예: per_control_variable: {환기전원: 0, 환기풍량: 1, 냉난방전원: 1}
+    # 각 값은 L에 비례해 ceiling으로 확대된다.
+    per_group_rolling_change_budget_reference_values:
+      equipment: null
+      per_control_variable: null
+    report_model_candidate_families:
+      - component_hvac_two_stage_extra_trees
 
 
 TRAIN:
@@ -494,7 +906,7 @@ TRAIN:
     wandb_iter: 500
     exp_name: default
     project_name: 'system_control'
-    entity: null
+    entity: null  # wandb 계정/팀 이름 (use: true일 때 지정)
 LOSS:
   loss_name: mse
 
@@ -506,3 +918,101 @@ OPTIMIZER:
 
 RESULT:
   savedir: './saved_model'
+
+# Independent six-method comparison. The legacy forecast/mpc tasks are unchanged.
+CONTROL_BENCHMARK:
+  output_directory: reports/artifacts/control_benchmark
+  environments: [livingroom, room1, room2]
+  seeds: [42]
+  selected_methods: [m1_affine_milp, m2_mode_history_milp, m3_physics_residual,
+                     m4_scenario_ensemble, m5_neural_cem, m6_decision_focused]
+  resume_from: null  # Previous benchmark root; reload frozen models, new evaluation directory.
+  resume_missing_models: false
+  align_episode_boundaries: true
+  memory_decay: 0.8
+  maximum_training_samples: 0  # 0 = all eligible train transitions.
+  evaluation_windows: 3
+  closed_loop_steps: 5
+  maximum_policy_violation_fraction: 0.05
+  torch_threads: 1
+  action_trust:
+    enabled: true
+    global_support:
+      minimum_samples: 20
+      minimum_episodes: 2
+    local_context_support:
+      enabled: true
+      minimum_samples_within_radius: 3
+      maximum_standardized_rms_distance: 2.0
+      neighbor_count: 3
+      maximum_mean_k_distance: 2.0
+  model_parameters:
+    ridge_alpha: 10.0
+    device: cpu
+    hidden_size: 64
+    epochs: 20
+    batch_size: 512
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    patience: 5
+    ensemble_size: 3
+    bootstrap_block: 128
+    decision_samples: 512
+    decision_horizon: 5
+    decision_epochs: 5
+    decision_batch_size: 32
+    decision_learning_rate: 0.0001
+    decision_temperature: 1.0
+    decision_anchor: 1.0
+    decision_validation_ratio: 1.25
+  planner:
+    maximum_changed_variables: 3
+    switch_penalty: 0.05
+    time_limit_seconds: 15.0  # Solver limit; wall time also includes assembly/validation.
+    mip_relative_gap: 0.05
+    state_box_padding: 2.0
+    mode_matrix_strategy: nominal_linearization  # Or exact_disjunction (much slower).
+    risk_weight: 0.5  # m4: (1-risk)*scenario mean + risk*scenario worst cost.
+    cem_population: 64
+    cem_iterations: 3
+    cem_elite_fraction: 0.2
+  methods:
+    m1_affine_milp:
+      model: affine
+      planner: baseline_milp
+      parameters: {ridge_alpha: 1.0}
+    m2_mode_history_milp:
+      model: mode_history
+      planner: joint_milp
+    m3_physics_residual:
+      model: physics_residual
+      planner: categorical_cem
+    m4_scenario_ensemble:
+      model: scenario_ensemble
+      planner: scenario_milp
+    m5_neural_cem:
+      model: neural_ensemble
+      planner: categorical_cem
+    m6_decision_focused:
+      model: decision_focused
+      planner: categorical_cem
+
+# 원본 MPC 섹션은 변경하지 않고, 전체 평가 runner에서 그대로 재사용한다.
+CONTROL_FULL_BENCHMARK:
+  output_directory: reports/artifacts/control_full_benchmark
+  parallel_workers: 2
+  environments: [livingroom, room1, room2]
+  seeds: [42]
+  methods: [m1_affine_milp, m2_mode_history_milp, m3_physics_residual,
+            m4_scenario_ensemble, m5_neural_cem, m6_decision_focused]
+  # 축소 pilot의 nominal linearization 대신 bounded-model exact disjunction.
+  mode_matrix_strategy: exact_disjunction
+  dataset_groups:
+    - name: v3
+      versions: [version3_260714_processed]
+    - name: v4
+      versions: [version4_260805_processed]
+    - name: v5
+      versions: [version5_260814_processed]
+    - name: concat
+      versions: [version3_260714_processed, version4_260805_processed, version5_260814_processed]

@@ -11,6 +11,8 @@ import pandas as pd
 from controllers.evaluator_benchmark import benchmark_evaluator_families
 from controllers.total_power_evaluation import (
     evaluate_all_chronological_test_total_power,
+    evaluate_mpc_counterfactual_total_power_report,
+    fit_frozen_chronological_total_power_model,
 )
 from data_provider.control_data import (
     ControlData,
@@ -21,6 +23,10 @@ from runners.evaluator_benchmark_runner import (
     _candidate_pool_experiments,
     _write_candidate_artifacts,
     _write_evaluator_artifacts,
+)
+from runners.report_model_input_ablation_runner import (
+    _case_summary,
+    _power_metric_assessment,
 )
 
 
@@ -131,6 +137,84 @@ def _benchmark_config():
 
 
 class TotalPowerExperimentTest(unittest.TestCase):
+    def test_report_input_ablation_summary_reads_transition_count_from_split(self):
+        data = _data(160)
+        evaluation, _ = evaluate_all_chronological_test_total_power(
+            data,
+            training_rows=np.arange(0, 99),
+            validation_rows=np.arange(100, 129),
+            test_rows=np.arange(130, 159),
+            report_model_config=_report_model_config(),
+            minimum_actual_power_w=0.1,
+            target_mape_percent=1.95,
+            minimum_validation_samples=10,
+            minimum_test_samples=10,
+            random_state=42,
+        )
+        evaluation['model_selection']['model']['input_features'] = {
+            'enabled_groups': ['current_state', 'action'],
+            'feature_dimension': 4,
+        }
+        row = _case_summary(
+            {'name': 'state_action', 'description': 'state + action'},
+            evaluation,
+            data.power_names,
+            {
+                'total_power_mape_percent': 1.95,
+                'component_mape_percent_by_output': {
+                    'ventilation_power': 1.95,
+                    'hvac_power': 1.95,
+                },
+                'minimum_component_mape_samples': 1,
+            },
+        )
+
+        self.assertEqual(row['test_transition_count'], 29)
+        self.assertIn('ventilation_power_mape_percent', row)
+        self.assertIn('hvac_power_mape_percent', row)
+        self.assertEqual(row['total_power_verdict'], '통과')
+        self.assertEqual(row['ventilation_power_verdict'], '통과')
+        self.assertEqual(row['hvac_power_verdict'], '통과')
+
+    def test_component_mape_verdicts_are_independent_from_total_power(self):
+        assessment = _power_metric_assessment(
+            total_value=3.0,
+            total_valid_samples=100,
+            total_reportable=True,
+            component_metrics={
+                'mape_percent_by_output': {
+                    'ventilation_power': 1.0,
+                    'hvac_power': 4.0,
+                },
+                'mape_valid_samples_by_output': {
+                    'ventilation_power': 100,
+                    'hvac_power': 100,
+                },
+                'mape_coverage_percent_by_output': {
+                    'ventilation_power': 100.0,
+                    'hvac_power': 100.0,
+                },
+            },
+            metric_targets={
+                'total_power_mape_percent': 1.95,
+                'component_mape_percent_by_output': {
+                    'ventilation_power': 1.95,
+                    'hvac_power': 1.95,
+                },
+                'minimum_component_mape_samples': 30,
+            },
+        )
+
+        self.assertEqual(assessment['total_power']['verdict'], '실패')
+        self.assertEqual(
+            assessment['components']['ventilation_power']['verdict'],
+            '통과',
+        )
+        self.assertEqual(
+            assessment['components']['hvac_power']['verdict'],
+            '실패',
+        )
+
     def test_relaxed_scenario_uses_its_own_holdout(self):
         cfg = OmegaConf.create({
             'DEFAULT': {'seed': 42},
@@ -228,6 +312,173 @@ class TotalPowerExperimentTest(unittest.TestCase):
             'action_median',
         )
         self.assertAlmostEqual(result['primary_metric']['value'], 0.0)
+        self.assertIn(
+            'component_power_prediction',
+            result['test_evaluation'],
+        )
+        self.assertEqual(
+            result['test_evaluation']['component_power_prediction'][
+                'output_names'
+            ],
+            list(data.power_names),
+        )
+        self.assertIn(f'actual_{data.power_names[0]}', audit_rows[0])
+        self.assertIn(f'predicted_{data.power_names[1]}', audit_rows[0])
+
+    def test_counterfactual_report_uses_mpc_action_and_recorded_baseline(self):
+        data = _data(160)
+        selection = fit_frozen_chronological_total_power_model(
+            data,
+            training_rows=np.arange(0, 99),
+            validation_rows=np.arange(100, 129),
+            report_model_config=_report_model_config(),
+            minimum_actual_power_w=0.1,
+            target_mape_percent=1.95,
+            minimum_validation_samples=10,
+            random_state=42,
+        )
+
+        class AlwaysOnController:
+            prediction_horizon = 1
+
+            def solve(self, initial_state, disturbances, previous_control):
+                return SimpleNamespace(
+                    success=True,
+                    status=0,
+                    message='optimal',
+                    objective=0.0,
+                    control_vectors=np.array([[0.0, 1.0]]),
+                )
+
+        result, audit_rows = evaluate_mpc_counterfactual_total_power_report(
+            data,
+            AlwaysOnController(),
+            selection,
+            evaluation_rows=np.arange(130, 150),
+            disturbance_forecast_method='persistence',
+            training_control_support=data.controls[:99],
+            minimum_actual_power_w=0.1,
+            minimum_test_mape_samples=10,
+            target_mape_percent=1.95,
+        )
+
+        self.assertTrue(result['reportable'])
+        self.assertAlmostEqual(result['primary_metric']['value'], 150.0)
+        report_to_report = result['mape_cases'][
+            'mpc_action_vs_recorded_action_report'
+        ]
+        self.assertTrue(report_to_report['reportable'])
+        self.assertAlmostEqual(report_to_report['value'], 150.0)
+        self.assertEqual(
+            result['test_evaluation']['action_changed_count'],
+            10,
+        )
+        self.assertAlmostEqual(
+            result['test_evaluation']['action_changed_percent'],
+            50.0,
+        )
+        self.assertAlmostEqual(
+            result['estimated_energy_reduction']['estimated_reduction_percent'],
+            -60.0,
+        )
+        self.assertIn('component_mape_cases', result)
+        self.assertEqual(
+            result['component_mape_cases']['mpc_action_vs_recorded_actual'][
+                'output_names'
+            ],
+            list(data.power_names),
+        )
+        self.assertIn(
+            f'recorded_actual_{data.power_names[0]}',
+            audit_rows[0],
+        )
+        self.assertIn(
+            f'mpc_action_report_predicted_{data.power_names[1]}',
+            audit_rows[0],
+        )
+        self.assertEqual(len(audit_rows), 20)
+        self.assertEqual(audit_rows[0]['recorded_control_switch'], 'OFF')
+        self.assertEqual(audit_rows[0]['mpc_control_switch'], 'ON')
+        self.assertAlmostEqual(
+            audit_rows[0]['recorded_total_hvac_power_w'],
+            25.0,
+        )
+        self.assertAlmostEqual(
+            audit_rows[0][
+                'mpc_counterfactual_predicted_total_hvac_power_w'
+            ],
+            100.0,
+        )
+        self.assertAlmostEqual(
+            audit_rows[0][
+                'recorded_action_report_predicted_total_hvac_power_w'
+            ],
+            25.0,
+        )
+        self.assertAlmostEqual(
+            result['report_to_report_predicted_energy_reduction'][
+                'estimated_reduction_percent'
+            ],
+            -60.0,
+        )
+
+    def test_current_recorded_action_reference_replays_action_at_distance_zero(self):
+        """The recorded-current reference is the factual K=0 sweep anchor."""
+        data = _data(160)
+        selection = fit_frozen_chronological_total_power_model(
+            data,
+            training_rows=np.arange(0, 99),
+            validation_rows=np.arange(100, 129),
+            report_model_config=_report_model_config(),
+            minimum_actual_power_w=0.1,
+            target_mape_percent=1.95,
+            minimum_validation_samples=10,
+            random_state=42,
+        )
+
+        class EchoReferenceController:
+            prediction_horizon = 1
+
+            def solve(self, initial_state, disturbances, previous_control):
+                return SimpleNamespace(
+                    success=True,
+                    status=0,
+                    message='optimal',
+                    objective=0.0,
+                    control_vectors=np.asarray([previous_control], dtype=float),
+                )
+
+        rows = np.arange(130, 150)
+        result, audit_rows = evaluate_mpc_counterfactual_total_power_report(
+            data,
+            EchoReferenceController(),
+            selection,
+            evaluation_rows=rows,
+            disturbance_forecast_method='persistence',
+            training_control_support=data.controls[:99],
+            minimum_actual_power_w=0.1,
+            minimum_test_mape_samples=10,
+            target_mape_percent=1.95,
+            first_action_reference='recorded_current_action',
+        )
+
+        self.assertEqual(
+            result['protocol']['first_action_reference'],
+            'recorded_current_action',
+        )
+        changed = result['test_evaluation'][
+            'changed_control_variables_from_reference'
+        ]
+        self.assertEqual(changed['minimum'], 0)
+        self.assertEqual(changed['maximum'], 0)
+        self.assertAlmostEqual(changed['mean'], 0.0)
+        self.assertEqual(result['test_evaluation']['action_changed_count'], 0)
+        self.assertTrue(
+            all(
+                row['recorded_control_switch'] == row['mpc_control_switch']
+                for row in audit_rows
+            )
+        )
 
     def test_evaluator_selection_uses_validation_and_reports_total_power(self):
         benchmark = benchmark_evaluator_families(
