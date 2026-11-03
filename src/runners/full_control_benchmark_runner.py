@@ -82,9 +82,14 @@ def scope_audit(cfg):
             )
         except ValueError as error:
             alignment_fallback = str(error)
+    policy_split = str(ev.get('policy_evaluation_split', 'test'))
+    if policy_split not in ('validation', 'test'):
+        raise ValueError('policy_evaluation_split must be validation or test')
     starts = _select_evaluation_windows(
-        data, test_start, int(ev.closed_loop_steps), int(ev.stride), int(ev.max_windows),
+        data, train_end if policy_split == 'validation' else test_start,
+        int(ev.closed_loop_steps), int(ev.stride), int(ev.max_windows),
         int(cfg.MPC.prediction_horizon), str(cfg.MPC.disturbance_forecast),
+        end_exclusive=test_start if policy_split == 'validation' else None,
     )
     repeated = ev.action_options.repeated_joint_actions
     support, _, _ = _training_control_support(

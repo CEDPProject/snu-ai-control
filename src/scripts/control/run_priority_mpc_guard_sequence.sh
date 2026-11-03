@@ -4,7 +4,7 @@
 # Phase 1: factual report-model calibration, evaluated on recorded actions.
 #          No MILP is solved here.
 # Phase 2: Full-guard MPC with a first-action categorical trust region K=1/2
-#          and a frozen-report action-effect limit of 1.95%.
+#          and a configured frozen-report action-effect limit.
 #
 # The Phase-2 report limit is fixed before test execution.  It uses only the
 # current x_t, d_t and a report model selected/refit before test; it never sees
@@ -82,7 +82,7 @@ run_phase2() {
   local log_file="${ARTIFACT_DIR}/logs/02_full_guard_k1_k2_effect_gate_${dataset}.log"
   local -a opts
   mapfile -t opts < <(dataset_opts "${dataset}")
-  echo "[02][${dataset}] Full Guard K=1,2 + 1.95% report-action gate started $(date --iso-8601=seconds)" | tee "${log_file}"
+  echo "[02][${dataset}] Full Guard K=1,2 + report-action gate started $(date --iso-8601=seconds)" | tee "${log_file}"
   "${PYTHON_BIN}" "${SRC_DIR}/main.py" \
     --task action_distance_ablation \
     --default_cfg "${DEFAULT_CFG}" \

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 옵션 1(강한 제약): MPC를 "학습 support가 충분한 관측 action" 안으로 강하게 밀어넣어,
 # MPC가 고른 action이 과거 관측과 자주 매칭되게 한다. 목적은 MPC-선택 action의
-# crossfit(실제-Y 매칭) 평가가 reportable해지고 KPI(≤1.95%)에 드는지 확인하는 것.
+# crossfit(실제-Y 매칭) 평가가 reportable해지고 MAPE 기준(target_percent) 이하인지 확인하는 것.
 #
 # 논리: report model은 반사실(취하지 않은 action)의 전력을 예측하려고 학습한 것이고,
 #       그 신뢰도는 관측 action에서 검증(candidate-pool, 이미 통과)된다. 옵션 1은

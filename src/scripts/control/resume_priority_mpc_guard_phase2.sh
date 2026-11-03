@@ -75,7 +75,7 @@ run_phase2_dataset() {
   local log_file="${ARTIFACT_DIR}/logs/02_full_guard_k1_k2_effect_gate_${dataset}.log"
   local -a opts
   mapfile -t opts < <(dataset_opts "${dataset}")
-  echo "[02][${dataset}] Full Guard K=1,2 + 1.95% report-action gate started $(date --iso-8601=seconds)" | tee "${log_file}"
+  echo "[02][${dataset}] Full Guard K=1,2 + report-action gate started $(date --iso-8601=seconds)" | tee "${log_file}"
   "${PYTHON_BIN}" "${SRC_DIR}/main.py" \
     --task action_distance_ablation \
     --default_cfg "${DEFAULT_CFG}" \

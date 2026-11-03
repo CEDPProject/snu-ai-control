@@ -1,16 +1,16 @@
 """성분별·총전력 전력예측을 설정 가능한 floor로 MAPE/WAPE 계산하고 pass/fail을 판정한다.
 
-방안 2(지표 조정)의 마무리 모듈.
+성분별 MAPE/WAPE gate 모듈.
 
 배경: 냉난방유효전력은 실제값의 절반 이상이 near-zero(≤1W)라 MAPE 분모가 폭발한다.
 따라서 (a) MAPE의 near-zero 분모를 floor로 제외하거나 (b) WAPE(Σ|오차|/Σ|실제|)를
 쓰는 것이 간헐부하에 대한 올바른 평가다. 기존 코드는 WAPE와 floor 기반 MAPE를
-'계산·저장'만 했고 공식 pass/fail 판정으로는 쓰지 않았다. 이 모듈은 그 판정을 추가한다.
+'계산·저장'만 했고 pass/fail 판정으로는 쓰지 않았다. 이 모듈은 그 판정을 추가한다.
 
 원칙:
 - MAPE/WAPE 정의는 기존 프레임워크와 동일(단순·투명한 수식).
 - 실제(recorded) action 기반 예측과 MPC action 기반 예측을 **둘 다** 판정한다.
-- floor와 target(≤1.95%)은 설정으로 조정 가능하다.
+- floor와 target_percent는 설정으로 조정 가능하다.
 - 이 값은 report model의 전력예측 정확도이며, MPC 절감/제어 성능이 아니다.
 """
 

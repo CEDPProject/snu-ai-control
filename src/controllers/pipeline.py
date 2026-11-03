@@ -1391,14 +1391,18 @@ def run_mpc_pipeline(cfg, result_dir: Path, *, control_backend=None):
             'test_evaluation': None,
         }
     duration_steps = int(evaluation_cfg.closed_loop_steps)
+    policy_split = str(evaluation_cfg.get('policy_evaluation_split', 'test'))
+    if policy_split not in ('validation', 'test'):
+        raise ValueError('policy_evaluation_split must be validation or test')
     starts = _select_evaluation_windows(
         data,
-        test_start,
+        train_end if policy_split == 'validation' else test_start,
         duration_steps,
         evaluation_cfg.stride,
         evaluation_cfg.max_windows,
         cfg.MPC.prediction_horizon,
         cfg.MPC.disturbance_forecast,
+        end_exclusive=test_start if policy_split == 'validation' else None,
     )
     lead_times = [int(value) for value in evaluation_cfg.lead_time_steps]
     LOGGER.info(
@@ -2371,6 +2375,8 @@ def run_mpc_pipeline(cfg, result_dir: Path, *, control_backend=None):
             'offline evaluation'
         ),
         'evaluation_protocol': {
+            'policy_evaluation_split': policy_split,
+            'validation_policy_is_not_independent_holdout': policy_split == 'validation',
             'sample_interval_minutes': int(cfg.MPC.sample_interval_minutes),
             'prediction_horizon_steps': int(cfg.MPC.prediction_horizon),
             'control_horizon_steps': int(cfg.MPC.control_horizon),
@@ -2585,7 +2591,7 @@ def run_mpc_pipeline(cfg, result_dir: Path, *, control_backend=None):
         index=False,
         encoding='utf-8-sig',
     )
-    # 방안 2(지표 조정): 성분별·총전력을 설정 floor로 MAPE/WAPE 계산하고 ≤target
+    # 성분별 MAPE/WAPE gate: 성분별·총전력을 설정 floor로 MAPE/WAPE 계산하고 ≤target
     # pass/fail을 판정한다(실제 action·MPC action 예측 모두). report model 예측
     # 정확도이며 제어 절감이 아니다.
     component_kpi_gate_cfg = cfg.MPC.get('component_kpi_gate')

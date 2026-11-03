@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# 방안 1(제어 action 제약) + 방안 2(성분별 MAPE/WAPE gate)를 함께 켠 MPC 실행.
+# action 제약 + 성분별 MAPE/WAPE gate를 함께 켠 MPC 실행.
 #
-# 방안 1 — MPC first action을 "학습 support가 충분한 action" 안에서 고르고
+# action 제약 — MPC first action을 "학습 support가 충분한 action" 안에서 고르고
 #          (action_trust, 기본 ON), 최근 실제 적용 action에서 급격히 벗어나지
 #          않도록 action_history 정규화와 switch_penalty를 강하게 준다. 이렇게 하면
 #          case A(MPC action → report → 실제)가 case B(실제 action)에 가까워진다.
 #          단, action_history/switch를 극단화해 MPC=recorded로 만들면 제어 의미가
 #          사라지므로(순환논리), support 내 최적화 여지는 남기는 값을 기본으로 둔다.
-# 방안 2 — component_kpi_gate(기본 ON)가 환기/냉난방/총전력을 설정 floor로
+# 성분별 gate — component_kpi_gate(기본 ON)가 환기/냉난방/총전력을 설정 floor로
 #          MAPE·WAPE 계산하고 ≤target pass/fail을 실제 action·MPC action 모두 판정해
 #          run 폴더에 component_kpi_gate.{csv,json}으로 남긴다.
 #
@@ -36,11 +36,11 @@ export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID:-1}"
 cd "${REPO_ROOT}"
 
-printf '방안1(action 제약)+방안2(component gate) MPC\n'
+printf 'action 제약 + component gate MPC\n'
 printf '  data=%s env=%s temp_upper=%s\n' "${DATA_VERSION}" "${ENVIRONMENT}" "${TEMP_UPPER}"
 printf '  action_trust=ON, action_history.penalty=%s, switch_penalty=%s\n' \
   "${HISTORY_PENALTY}" "${SWITCH_PENALTY}"
-printf '  component_kpi_gate=ON, floor=%sW, target=1.95%%\n' "${GATE_FLOOR_W}"
+printf '  component_kpi_gate=ON, floor=%sW, target=설정값(MPC.component_kpi_gate.target_percent)\n' "${GATE_FLOOR_W}"
 
 exec "${PYTHON_BIN}" "${SRC_DIR}/main.py" \
   --task mpc \

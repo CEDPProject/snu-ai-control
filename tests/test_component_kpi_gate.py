@@ -46,7 +46,7 @@ class ComponentGateTest(unittest.TestCase):
         # 환기: 안정(≈40W), 정확 예측 → pass. 냉난방: near-zero, 부정확 → fail.
         n = 50
         vent_actual = np.full(n, 40.0)
-        vent_pred = vent_actual * 1.005  # 0.5% 오차 → 1.95% 통과
+        vent_pred = vent_actual * 1.005  # 0.5% 오차 → target 통과
         hvac_actual = np.array([0.2, 30.0] * (n // 2))
         hvac_pred = hvac_actual + 5.0
         return pd.DataFrame(
@@ -75,7 +75,7 @@ class ComponentGateTest(unittest.TestCase):
         vent = next(
             r for r in rows if r["target"] == "환기유효전력(W)" and r["action_source"] == "recorded_action"
         )
-        self.assertTrue(vent["mape_pass"])  # 0.5% ≤ 1.95%
+        self.assertTrue(vent["mape_pass"])  # 0.5% ≤ target
         hvac = next(
             r for r in rows if r["target"] == "냉난방유효전력(W)" and r["action_source"] == "recorded_action"
         )

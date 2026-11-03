@@ -10,6 +10,32 @@ from torch import nn
 from .base import ControlModel
 
 
+def contiguous_rollout_starts(rows, horizon):
+    """학습 split 내부에서 gap/segment join을 건너지 않는 연속 transition만 허용."""
+    rows = np.asarray(rows)
+    if horizon < 1:
+        raise ValueError('rollout horizon must be positive')
+    starts = np.arange(max(0, len(rows)-horizon+1))
+    if not len(starts):
+        return starts
+    return starts[np.all(
+        rows[starts[:, None]+np.arange(horizon)] == rows[starts, None]+np.arange(horizon), axis=1)]
+
+
+class SeparateResidualHeads(nn.Module):
+    """상태와 각 전력 성분에 독립 MLP를 둔 ablation. 파라미터 수가 증가한다."""
+
+    def __init__(self, width, hidden, nx, npower):
+        super().__init__()
+        self.heads = nn.ModuleList([
+            nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, hidden),
+                          nn.GELU(), nn.Linear(hidden, output))
+            for output in [nx, *([1]*npower)]])
+
+    def forward(self, inputs):
+        return torch.cat([head(inputs) for head in self.heads], dim=-1)
+
+
 class TransportBackbone(nn.Module):
     """Nonnegative transport rates plus a learned source per state.
 
@@ -142,18 +168,50 @@ class NeuralHistoryModel(ControlModel):
         self.target_scale = residual.std(0, unbiased=False).clamp_min(1e-3)
         width = inputs.shape[1]
         hidden = int(self.parameters.get('hidden_size', 64))
-        self.network = nn.Sequential(nn.Linear(width, hidden), nn.GELU(),
-                                     nn.Linear(hidden, hidden), nn.GELU(),
-                                     nn.Linear(hidden, self.spec.nx + self.spec.np)).to(self.device)
+        separate = bool(self.parameters.get('separate_power_heads', False))
+        self.network = (SeparateResidualHeads(width, hidden, self.spec.nx, self.spec.np)
+                        if separate else nn.Sequential(
+                            nn.Linear(width, hidden), nn.GELU(),
+                            nn.Linear(hidden, hidden), nn.GELU(),
+                            nn.Linear(hidden, self.spec.nx+self.spec.np))).to(self.device)
         # Begin at the mean residual, avoiding huge random physical predictions.
-        nn.init.zeros_(self.network[-1].weight)
-        nn.init.zeros_(self.network[-1].bias)
+        final_layers = [head[-1] for head in self.network.heads] if separate else [self.network[-1]]
+        for layer in final_layers:
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
         optimizer = torch.optim.AdamW(self.network.parameters(),
                                      lr=float(self.parameters.get('learning_rate', 1e-3)),
                                      weight_decay=float(self.parameters.get('weight_decay', 1e-4)))
         batch_size = int(self.parameters.get('batch_size', 512))
         patience = int(self.parameters.get('patience', 5))
         best_loss, stale, best = float('inf'), 0, None
+        rollout_horizon = int(self.parameters.get('rollout_training_steps', 1))
+        rollout_weight = float(self.parameters.get('rollout_training_weight', .1))
+        if rollout_horizon < 1 or not np.isfinite(rollout_weight) or rollout_weight < 0:
+            raise ValueError('Invalid rollout training settings')
+        if rollout_horizon > 1:
+            valid_starts = contiguous_rollout_starts(train.rows, rollout_horizon)
+            if not len(valid_starts):
+                raise ValueError('No contiguous train-only rollout sequences')
+            valid_rollout = torch.zeros(len(train.rows), dtype=torch.bool, device=self.device)
+            valid_rollout[valid_starts] = True
+            next_states = torch.as_tensor(train.next_states, dtype=torch.float32, device=self.device)
+
+        def rollout_loss(indices):
+            ctx = tensors[0][indices]
+            losses = []
+            for lead in range(rollout_horizon):
+                z, d = tensors[1][indices+lead], tensors[2][indices+lead]
+                raw = self._raw_torch(ctx, z, d)
+                x = ctx[:, :self.spec.nx]+raw[:, :self.spec.nx]
+                state_error = (x-next_states[indices+lead])/self.target_scale[:self.spec.nx]
+                power_error = (torch.relu(raw[:, self.spec.nx:])
+                               -targets[indices+lead, self.spec.nx:])/self.target_scale[self.spec.nx:]
+                losses.append(torch.cat([state_error, power_error], -1).square().mean())
+                ctx = torch.cat([
+                    x, ctx[:, :self.spec.nx], z,
+                    self.spec.decay*ctx[:, -self.spec.nz:]+(1-self.spec.decay)*z], -1)
+            return torch.stack(losses).mean()
         if validation is not None:
             # Fixed, outcome-blind subsample solely for early stopping.
             ids = np.linspace(0, len(validation.rows)-1, min(len(validation.rows), 10000), dtype=int)
@@ -170,6 +228,10 @@ class NeuralHistoryModel(ControlModel):
             for indices in order.split(batch_size):
                 prediction = self._raw_torch(*(a[indices] for a in tensors))
                 loss = ((prediction - targets[indices]) / self.target_scale).square().mean()
+                if rollout_horizon > 1 and rollout_weight:
+                    starts = indices[valid_rollout[indices]][:128]
+                    if len(starts):
+                        loss = loss+rollout_weight*rollout_loss(starts)
                 if not torch.isfinite(loss):
                     raise FloatingPointError('Non-finite neural training loss')
                 optimizer.zero_grad()
@@ -183,6 +245,11 @@ class NeuralHistoryModel(ControlModel):
                             if validation is not None else total / len(targets))
             self.training_log.append({'stage': 'supervised', 'epoch': epoch+1,
                                       'train_loss': total/len(targets), 'validation_loss': val_loss})
+            if rollout_horizon > 1:
+                self.training_log[-1].update(
+                    rollout_training_steps=rollout_horizon,
+                    rollout_training_weight=rollout_weight,
+                    rollout_checkpoint_selection='one_step_validation_loss')
             if val_loss < best_loss - 1e-7:
                 best_loss, best, stale = val_loss, deepcopy(self.network.state_dict()), 0
             else:

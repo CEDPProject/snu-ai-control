@@ -1,13 +1,13 @@
 #!/usr/bin/env python
-"""Reprocess Kweather version3 (1회차) Excel files under the shared processed contract.
+"""Reprocess Kweather version3 Excel files under the shared processed contract.
 
 version3_260714_processed는 초기 파이프라인으로 만들어져 결측 보간 / 제어 결측
 채움 / OFF canonicalization 이 적용되지 않았고, 허용 밖 카테고리(냉난방설정온도=25)와
 다수의 결측이 남아 있었다. 이 스크립트는 version4/version5와 **동일한 전처리 계약**을
 version3 원본에 적용해 세 버전의 processed 계약을 통일한다.
 
-- 원본: `data_arxiv/version3_260714/{거실,방1,방2}/...1회차_가공.xlsx`
-  (기존 `version3_260714_processed`와 행 수 25,063이 정확히 일치하는 원천)
+- 원본: 공간별(거실·방1·방2) 가공 Excel 파일
+  (기존 `version3_260714_processed`와 행 수가 일치하는 원천)
 - 변환 로직은 :mod:`prepare_kweather_version4`를 그대로 재사용한다.
 """
 
@@ -43,7 +43,7 @@ def _write_markdown_report(report: dict[str, Any], path: Path, version_label: st
         "",
         f"- 기존 `{version_label}_processed`는 초기 파이프라인 산출물로, 결측 보간 / 제어 결측 채움 / OFF canonicalization 이 적용되지 않았고 허용 밖 카테고리(냉난방설정온도=25)와 다수의 결측이 남아 있었다.",
         f"- 이 재처리는 version4/version5와 동일한 전처리 계약(`prepare_kweather_version4.py`)을 `{version_label}` 원본에 적용해 세 버전의 processed 계약을 통일한다.",
-        f"- 원본은 `data_arxiv/{version_label}/{{거실,방1,방2}}/...1회차_가공.xlsx`이며, 기존 processed와 행 수(25,063)가 정확히 일치한다.",
+        "- 원본은 공간별(거실·방1·방2) 가공 Excel 파일이며, 기존 processed와 행 수가 일치한다.",
         "- 제어 카테고리는 현재 MPC 설정 허용값에 맞도록 OFF 상태를 대표 제어값으로 정규화했다.",
         "- 숫자 결측은 시간순 선형 보간 후 앞/뒤 채움으로 해소했다(결과 CSV 결측 0).",
         "",
@@ -90,7 +90,7 @@ def _write_markdown_report(report: dict[str, Any], path: Path, version_label: st
             "",
             "## 수정 정책",
             "",
-            "version4/version5와 동일한 정책을 적용했다. 세부 근거는 `reports/docs/kweather_version4_260805_preprocessing_logic.md`를 참고한다.",
+            "version4/version5와 동일한 정책을 적용했다. 세부 구현은 `prepare_kweather_version4.py`를 참고한다.",
             "",
             "1. 컬럼 검증: 기존 processed CSV의 23개 컬럼과 정확히 일치하는지 확인하고, 다르면 변환을 중단한다.",
             "2. 시간 정렬과 중복 제거: `데이터 시간`을 datetime으로 파싱해 오름차순 정렬하고, 동일 timestamp가 있으면 마지막 값을 남긴다.",
@@ -150,7 +150,7 @@ def _write_markdown_report(report: dict[str, Any], path: Path, version_label: st
             "",
             "## 데이터 품질 메모",
             "",
-            "- 실외 환경 변수가 약 21.6%로 가장 큰 보간 대상이다. 외부 기상 원천 데이터가 추가되면 다시 대체하는 것이 좋다.",
+            "- 실외 환경 변수가 가장 큰 보간 대상이다. 외부 기상 원천 데이터가 추가되면 다시 대체하는 것이 좋다.",
             "- 허용값 밖 제어 카테고리(`냉난방설정온도=25`)는 모두 냉난방 OFF 행에서만 나타났고, OFF canonicalization으로 대표값 22로 정규화됐다.",
             "- 이 재처리로 기존 v3 processed 대비 결측이 채워지고 OFF 하위 제어가 대표값으로 고정되므로, v3 기반 기존 학습/실험 산출물은 재실행이 필요할 수 있다.",
             "",

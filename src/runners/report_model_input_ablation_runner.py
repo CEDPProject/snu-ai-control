@@ -522,7 +522,7 @@ def _write_expansion_markdown(path: Path, rows, power_names) -> None:
         '- 모든 표는 같은 outcome-blind episode-group holdout 규칙을 사용한다.',
         '- 환기유효전력 MAPE, 냉난방유효전력 MAPE, 총전력 pooled MAPE를 각각의 '
         '목표값으로 별도 판정한다. worst action과 action pass는 총전력 기준이다.',
-        '- 후보 순위·report-model family·공식 K는 validation만으로 선택하며, test '
+        '- 후보 순위·report-model family·대표 K는 validation만으로 선택하며, test '
         '전력은 선택 이후에만 평가한다. `official_selected_k` 외 prefix는 '
         'sensitivity-only다.',
         '',

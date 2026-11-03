@@ -8,8 +8,8 @@
 #    01_all_data / 02_candidate_pool_experiments / 03_evaluators / 04_full_mpc
 #    tree under saved_model/<dataset_label>/<env>/mpc_experiments/<run>.
 #
-# Sequential on purpose: this host has 8 cores / ~13GB free RAM, so parallel
-# runs on the 97k-row concat dataset would risk OOM.
+# Sequential on purpose: parallel runs on the large concat dataset can exhaust
+# memory on a typical workstation.
 set -Euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,8 +21,7 @@ DEFAULT_CFG="${DEFAULT_CFG:-${SRC_DIR}/configs/default_setting.yaml}"
 
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
-# Pin to GPU1 by default (GPU0 is often shared with other tenants on this host).
-# Override with GPU_ID=0 (or "" for CPU) if needed.
+# GPU to use (default 1). Override with GPU_ID=0 (or "" for CPU) if needed.
 export CUDA_VISIBLE_DEVICES="${GPU_ID:-1}"
 cd "${REPO_ROOT}"
 
@@ -30,13 +29,11 @@ CONCAT="version3_260714_processed,version4_260805_processed,version5_260814_proc
 ENVIRONMENTS=(livingroom room1 room2)
 
 # Per-dataset indoor-temperature upper bound (state_constraints index 4 = 실내온도).
-# Set to each dataset's ~median indoor temp so violations stay SHALLOW: this is what
-# keeps the MILP tractable. A fixed 26C is unachievable for the hot summer data (rooms
-# run 31-40C), so it is violated deeply on every step -> the soft-constraint penalty
-# dominates and flattens the objective -> branch-and-bound explodes (~15-38s/solve,
-# 66% fallback). Matching the bound to each dataset (v3 May cool -> 27, v4/v5 hot -> 32,
-# concat mixed -> 31) restores v3-like shallow violations -> ~0.13s/solve, 0 fallback
-# (validated on v5/livingroom). state_constraints.4 is 실내온도(℃) in default_setting.yaml.
+# Set per dataset so violations stay shallow, which keeps the MILP tractable. A bound
+# far below the observed indoor temperature is violated deeply on every step: the
+# soft-constraint penalty then dominates and flattens the objective, and
+# branch-and-bound slows down sharply. state_constraints.4 is 실내온도(℃) in
+# default_setting.yaml.
 
 # data-config label -> OmegaConf override for that config (data version + temp bound)
 declare -A DATA_OPTS=(
@@ -45,15 +42,13 @@ declare -A DATA_OPTS=(
   [v4]="DATASET.data_version=version4_260805_processed DATASET.data_versions=null MPC.state_constraints.4.upper=32.0"
   [v5]="DATASET.data_version=version5_260814_processed DATASET.data_versions=null MPC.state_constraints.4.upper=32.0"
 )
-# singles first (faster -> early results), concat last (largest ~4-8h).
+# singles first (faster -> early results), concat last (largest).
 DATA_ORDER=(v5 v3 v4 concat_v3v4v5)
 
-# Relaxed MILP solver settings. The reprocessed/sparse-support data yields many
-# near-tied allowed actions in a no-good-cut-restricted feasible region, so proving
-# the default 1% optimality gap takes ~38s/solve (hitting the 60s limit) and would
-# make the full matrix take weeks. Relaxing to a 5% gap + 15s limit collapses solves
-# to ~2.7s (validated on v5/livingroom) with no meaningful quality loss: the affine
-# power model's own WAPE (~9%) is far larger than the 5% optimality gap.
+# Relaxed MILP solver settings. Sparse-support data yields many near-tied allowed
+# actions in a no-good-cut-restricted feasible region, so proving the default 1%
+# optimality gap often hits the time limit. A 5% gap + 15s limit keeps the full
+# matrix tractable; the gap is small relative to the power model's own error.
 SOLVER_OPTS="MPC.solver.mip_relative_gap=0.05 MPC.solver.time_limit_seconds=15"
 
 TS="$(date '+%Y%m%d_%H%M%S')"

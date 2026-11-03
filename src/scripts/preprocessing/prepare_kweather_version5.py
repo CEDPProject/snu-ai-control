@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Prepare Kweather version5 (3회차) Excel files for forecast and MPC pipelines.
+"""Prepare Kweather version5 Excel files for forecast and MPC pipelines.
 
 version5_260814는 version4_260805와 동일한 원본 구조(`거실/방1/방2`의 공간별
 `가공.xlsx` + `미가공.xlsx`)와 동일한 23개 컬럼 계약을 가진다. 따라서 핵심 변환
@@ -105,7 +105,7 @@ def _write_markdown_report(report: dict[str, Any], path: Path, version_label: st
             "",
             "## 수정 정책",
             "",
-            "version4와 동일한 정책을 적용했다. 세부 근거는 `reports/docs/kweather_version4_260805_preprocessing_logic.md`를 참고한다.",
+            "version4와 동일한 정책을 적용했다. 세부 구현은 `prepare_kweather_version4.py`를 참고한다.",
             "",
             "1. 컬럼 검증: 기존 processed CSV의 23개 컬럼과 정확히 일치하는지 확인하고, 다르면 변환을 중단한다.",
             "2. 시간 정렬과 중복 제거: `데이터 시간`을 datetime으로 파싱해 오름차순 정렬하고, 동일 timestamp가 있으면 마지막 값을 남긴다.",

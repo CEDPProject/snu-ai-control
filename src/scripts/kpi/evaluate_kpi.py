@@ -1,9 +1,9 @@
-"""KPI 평가 프로그램: 고정된 forecast 모델로 시험 구간을 추론하고 표준화 MSE를 산출한다.
+"""예측 성능 평가 프로그램: 고정된 forecast 모델로 시험 구간을 추론하고 표준화 MSE를 산출한다.
 
 학습은 하지 않는다. 공간(environment)마다 ``<model-dir>/<env>/configs.yaml``(학습 시 저장된 설정)과
 ``best_model.pt``(학습된 가중치)를 읽고, 학습 파이프라인과 같은 데이터 로더로 시험 구간의
 모든 예측 구간을 추론한다. MSE는 학습 구간의 평균·표준편차로 표준화한 값에서 계산하며,
-3개 공간의 모든 예측값을 합친 통합 MSE를 KPI 목표와 비교한다.
+3개 공간의 모든 예측값을 합친 통합 MSE도 계산하며, ``--kpi``로 목표를 주면 그 값과 비교한다.
 
 사용 예 (저장소 루트에서):
     python src/scripts/kpi/evaluate_kpi.py \
@@ -172,6 +172,10 @@ def plot_results(results, pooled, kpi, out_dir: Path, font_path, day: str):
     # 1) 실측 vs 60분 앞 예측 (대표 하루, 공간별)
     fig, axes = plt.subplots(len(results), 1, figsize=(11, 3.1 * len(results)), dpi=150, facecolor=surface)
     axes = np.atleast_1d(axes)
+    if day is None:  # 기본: 시험 구간의 첫 예측 시점이 속한 날
+        first = results[0]
+        day = str((first['_arrays']['first_target_time'][0]
+                   + np.timedelta64(first['pred_len'] - 1, 'm')).astype('datetime64[D]'))
     day_start = np.datetime64(day)
     day_end = day_start + np.timedelta64(1, 'D')
     for ax, res in zip(axes, results):
@@ -196,7 +200,7 @@ def plot_results(results, pooled, kpi, out_dir: Path, font_path, day: str):
         ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%H:%M'))
         ax.legend(loc='upper right', frameon=False, fontsize=9, labelcolor=ink)
     axes[-1].set_xlabel(f'시각 ({day})', color=ink2, fontsize=9)
-    fig.suptitle('환기 유효전력 실측값과 60분 앞 예측값 (케이웨더 v4 시험 구간 중 하루)',
+    fig.suptitle('환기 유효전력 실측값과 60분 앞 예측값 (시험 구간 중 하루)',
                  x=0.01, ha='left', fontsize=12, color=ink)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out_dir / 'pred_vs_actual.png', facecolor=surface)
@@ -211,9 +215,10 @@ def plot_results(results, pooled, kpi, out_dir: Path, font_path, day: str):
     bars[-1].set_hatch('///')
     bars[-1].set_facecolor('#8fb5e6')
     bars[-1].set_edgecolor(actual_c)
-    y_max = max(max(values), kpi) * 1.2
+    y_max = max(values + ([kpi] if kpi is not None else [])) * 1.2
     gap = y_max * 0.02
-    labels_above = kpi - max(values) > y_max * 0.12  # 목표선이 막대보다 충분히 위에 있으면 값을 막대 위에
+    # 목표선이 없거나 막대보다 충분히 위에 있으면 값을 막대 위에
+    labels_above = kpi is None or kpi - max(values) > y_max * 0.12
     for i, (bar, value) in enumerate(zip(bars, values)):
         pooled_bar = i == len(values) - 1
         x = bar.get_x() + bar.get_width() / 2
@@ -222,15 +227,16 @@ def plot_results(results, pooled, kpi, out_dir: Path, font_path, day: str):
         else:
             ax.text(x, value - gap, f'{value:.4f}', ha='center', va='top', fontsize=9.5,
                     color=ink if pooled_bar else surface, fontweight='bold')
-    ax.axhline(kpi, color=ink2, lw=1.2, ls=(0, (5, 3)))
-    if labels_above:
-        ax.text(-0.45, kpi - gap, f'목표 {kpi:.3f} 이하', ha='left', va='top', fontsize=9, color=ink2)
-    else:
-        ax.text(-0.45, kpi + gap / 2, f'목표 {kpi:.3f} 이하', ha='left', va='bottom', fontsize=9, color=ink2)
+    if kpi is not None:
+        ax.axhline(kpi, color=ink2, lw=1.2, ls=(0, (5, 3)))
+        if labels_above:
+            ax.text(-0.45, kpi - gap, f'목표 {kpi:.3f} 이하', ha='left', va='top', fontsize=9, color=ink2)
+        else:
+            ax.text(-0.45, kpi + gap / 2, f'목표 {kpi:.3f} 이하', ha='left', va='bottom', fontsize=9, color=ink2)
     ax.set_ylim(0, y_max)
     ax.set_xlim(-0.5, len(values) - 0.5)
     ax.set_ylabel('MSE (학습 구간 기준 표준화)', color=ink2, fontsize=9)
-    ax.set_title('공간별·통합 MSE (케이웨더 v4 시험 구간)', loc='left', fontsize=11, color=ink)
+    ax.set_title('공간별·통합 MSE (시험 구간)', loc='left', fontsize=11, color=ink)
     ax.grid(True, axis='y', color=grid, lw=0.6)
     ax.set_axisbelow(True)
     ax.tick_params(colors=ink2, labelsize=9)
@@ -244,16 +250,18 @@ def plot_results(results, pooled, kpi, out_dir: Path, font_path, day: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Forecast KPI evaluation (inference only)')
+    parser = argparse.ArgumentParser(description='Forecast evaluation (inference only)')
     parser.add_argument('--data-dir', required=True, type=Path,
                         help='데이터 버전 폴더 (예: .../kweather/version4_260805_processed)')
     parser.add_argument('--model-dir', required=True, type=Path,
                         help='<env>/best_model.pt 와 <env>/configs.yaml 이 있는 폴더')
     parser.add_argument('--envs', nargs='+', default=['livingroom', 'room1', 'room2'])
     parser.add_argument('--out', type=Path, default=Path('kpi_result'))
-    parser.add_argument('--kpi', type=float, default=0.233, help='통합 MSE 목표(이하이면 PASS)')
+    parser.add_argument('--kpi', type=float, default=None,
+                        help='통합 MSE 목표 (선택; 주면 이하일 때 PASS로 판정)')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--plot-day', default='2026-07-20', help='비교 그래프에 그릴 날짜 (YYYY-MM-DD)')
+    parser.add_argument('--plot-day', default=None,
+                        help='비교 그래프에 그릴 날짜 (YYYY-MM-DD, 기본: 시험 구간 첫날)')
     parser.add_argument('--font', type=Path, default=None,
                         help='그래프용 한글 폰트 (기본: <data-dir>/../fonts/NanumGothic-Regular.ttf)')
     parser.add_argument('--no-plot', action='store_true')
@@ -266,11 +274,12 @@ def main():
     data_dir = args.data_dir.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
 
-    print(f"[KPI 평가] {datetime.now():%Y-%m-%d %H:%M:%S}")
+    print(f"[예측 성능 평가] {datetime.now():%Y-%m-%d %H:%M:%S}")
     print(f"  데이터   : {data_dir}")
     print(f"  모델     : {args.model_dir}")
     print(f"  장치     : {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == 'cuda' else ''))
-    print(f"  목표     : 3개 공간 통합 MSE(표준화) <= {args.kpi:.3f}")
+    if args.kpi is not None:
+        print(f"  목표     : 3개 공간 통합 MSE(표준화) <= {args.kpi:.3f}")
 
     results = [evaluate_env(env, args.model_dir, data_dir, device) for env in args.envs]
     first = results[0]
@@ -289,7 +298,7 @@ def main():
         'points': pooled_points,
         'mse_norm': sum(r['sum_sq_err_norm'] for r in results) / pooled_points,
     }
-    passed = pooled['mse_norm'] <= args.kpi
+    passed = None if args.kpi is None else bool(pooled['mse_norm'] <= args.kpi)
 
     print("\n[추론 결과]")
     widths, aligns = [13, 9, 10, 12, 9, 8, 8], ['left'] + ['right'] * 6
@@ -299,7 +308,9 @@ def main():
                    f"{r['mse_w2']:.2f}", f"{r['target_mean_w']:.2f}", f"{r['target_std_w']:.2f}"], widths, aligns)
     print_row(['3개 공간 통합', f"{pooled['windows']:,}", f"{pooled['points']:,}", f"{pooled['mse_norm']:.4f}", '', '', ''],
               widths, aligns)
-    print(f"\n[판정] 통합 MSE {pooled['mse_norm']:.4f} {'<=' if passed else '>'} {args.kpi:.3f} → {'PASS' if passed else 'FAIL'}")
+    if passed is not None:
+        print(f"\n[판정] 통합 MSE {pooled['mse_norm']:.4f} {'<=' if passed else '>'} {args.kpi:.3f}"
+              f" → {'PASS' if passed else 'FAIL'}")
 
     for r in results:
         arrays = r.pop('_arrays')
@@ -312,12 +323,12 @@ def main():
         'data_dir': str(data_dir),
         'model_dir': str(args.model_dir),
         'device': str(device),
-        'kpi_target_mse': args.kpi,
+        'target_mse': args.kpi,
         'metric': 'MSE on targets standardized with the training split mean/std of each space',
         'spaces': {r['env']: {k: v for k, v in r.items() if not k.startswith('_') and k != 'sum_sq_err_norm'}
                    for r in results},
         'pooled': pooled,
-        'result': 'PASS' if passed else 'FAIL',
+        'result': None if passed is None else ('PASS' if passed else 'FAIL'),
     }
     (args.out / 'kpi_result.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
 

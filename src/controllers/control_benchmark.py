@@ -341,6 +341,9 @@ class CategoricalCEM:
 
 
 def create_control_planner(family, model, actions, constraints, logical_rules, options, training_contexts):
+    if family == 'energy_categorical_cem':
+        from controllers.energy_cem import EnergyCategoricalCEM
+        return EnergyCategoricalCEM(model, actions, constraints, logical_rules, options, training_contexts)
     registry = {'baseline_milp': BaselinePlanner, 'joint_milp': JointScenarioMILP,
                 'scenario_milp': JointScenarioMILP, 'categorical_cem': CategoricalCEM}
     if family not in registry:

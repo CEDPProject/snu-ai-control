@@ -264,11 +264,11 @@ python src/main.py --task forecast --model_name PatchTST
 | `affine_model_metrics.json` | train/validation/test one-step 모델 지표 |
 | `independent_evaluator_metadata.json` | 비선형 평가 plant의 학습 범위·설정 |
 | `model_validation.json` | one-step·recursive 60분·lead-time별 모델 검증 |
-| `mpc_evaluation.json` | 품질 gate, 폐루프 정책 KPI, window별 결과, 공식 대표 지표 |
+| `mpc_evaluation.json` | 품질 gate, 폐루프 정책 KPI, window별 결과, 대표 지표 |
 | `mpc_first_actions.csv` | 평가 window별 첫 제어 명령 |
 | `mpc_closed_loop_steps.csv` | 매분 제어·solver·Affine/evaluator 전력 기록 |
 | `chronological_action_split_support.json/.csv` | 시간 순 split별 joint action 표본·episode support |
-| `fixed_optimal_action_split_support.csv` | 공식 평가 후보별 train/validation/test support |
+| `fixed_optimal_action_split_support.csv` | 대표 평가 후보별 train/validation/test support |
 | `fixed_optimal_action_test_predictions.csv` | 확정 action의 test 실제·예측 총전력, 행별 오차, 상태 제약 만족 여부 |
 | `mpc_selected_action_crossfit_predictions.csv` | MPC 선택 조합의 out-of-fold 실제·예측 전력 (보조 지표) |
 | `observed_combination_test_predictions.csv` | 이전 단일 조합 민감도 분석용 (기본 비활성) |
@@ -327,7 +327,7 @@ python src/main.py --task mpc --opts \
 
 | 평가 | 질문 | 위치 (`mpc_evaluation.json`) |
 |---|---|---|
-| 공식 fixed-action MAPE | 고정한 최적 action의 총전력을 실제 Y로 얼마나 정확히 예측하는가 | `fixed_optimal_action_holdout_evaluation`, 최상위 `primary_metric` |
+| 대표 fixed-action MAPE | 고정한 최적 action의 총전력을 실제 Y로 얼마나 정확히 예측하는가 | `fixed_optimal_action_holdout_evaluation`, 최상위 `primary_metric` |
 | counterfactual report MAPE | MPC가 바꾼 action이 예측 전력을 얼마나 바꾸는가 | `mpc_counterfactual_total_power_report_evaluation` |
 | rolling cross-fit MAPE (보조) | MPC가 고른 조합을 과거 데이터만으로 검증하면 어떤가 | `mpc_selected_action_crossfit_evaluation` |
 | 폐루프 정책 평가 | 같은 plant에서 MPC가 기록 제어보다 에너지·제약 면에서 나은가 | 정책 KPI, bootstrap |
@@ -384,7 +384,7 @@ MPC:
 - 적용 설정·치환 건수: `evaluation_protocol.action_options`, `evaluation_protocol.control_preprocessing`
 - 조합별 허용 여부·표본 수·제외 사유: `control_support.actions`
 
-### 공식 지표: 실제 Y 기반 fixed-action MAPE
+### 대표 지표: 실제 Y 기반 fixed-action MAPE
 
 절차 (`fixed_optimal_action_holdout_evaluation`):
 
@@ -406,7 +406,7 @@ MAPE(%)               = 100 / n × Σ |actual − predicted| / |actual|
 - 분모가 `mape_min_actual_power_w` 이하인 행은 제외, exact-match 수·episode 수·유효 표본 수 함께 저장
 - 후보가 없으면 실제 Y를 대체 생성하지 않고 `primary_metric.value=null`
 - 대표값: `fixed_optimal_action_holdout_evaluation.primary_metric.value` (최상위 `primary_metric`에도 복사)
-  - 기본 목표 `target_percent=1.950`, 달성 여부는 `target_achieved`와 policy gate `fixed_optimal_action_mape_target`
+  - 기준값은 설정 `target_percent`, 달성 여부는 `target_achieved`와 policy gate `fixed_optimal_action_mape_target`
   - `reportable`, `selection`, `split`, `test_evaluation`과 함께 해석
 - 모델 선택 근거: `fixed_action_power_model_comparison.json`/`.csv`
 - 해석 시 주의
@@ -428,7 +428,7 @@ input_features:
   - MILP 재실행 없음 → controller 비교가 아닌 report model 입력 비교
   - 결과: `saved_model/<data>/<environment>/report_model_input_ablation/<run>/`
   - 후보 풀 Top-K 민감도(`previous_7`, `expanded_9`~`expanded_17`, `exploratory_41`)를 함께 보고.
-    validation이 고른 K만 공식값이고 나머지는 민감도 전용
+    validation이 고른 K만 대표값이고 나머지는 민감도 전용
   - `metric_targets`로 총전력·성분별 목표를 따로 설정, 판정도 환기·냉난방·총전력별로 기록
 
 ### counterfactual report MAPE
@@ -459,7 +459,7 @@ report_to_report_reduction     = ŷ^recorded − ŷ^MPC
 
 - `mpc_selected_action_crossfit_evaluation`: 폐루프에서 MPC가 고른 action·context를 모아, 과거 데이터만으로 학습한 5개 expanding fold의 out-of-fold 실제 Y 중 같은 action·유사 context 행과 대응
 - 조합별 총전력 MAPE를 MPC 선택 빈도 가중·동일 가중으로 함께 기록
-- 시간 방향으로 더 엄격하지만 희소 action support·context coverage에 민감 → 공식 지표와 역할 구분
+- 시간 방향으로 더 엄격하지만 희소 action support·context coverage에 민감 → 대표 지표와 역할 구분
 - `observed_control_combination_evaluation`: 이전 단일 조합 민감도 분석용, 기본 비활성
 
 ### 폐루프 정책 평가
@@ -485,8 +485,8 @@ report_to_report_reduction     = ŷ^recorded − ŷ^MPC
 - window 20개 이상, bootstrap 절감률 하한 > 0%
 - 모든 상태에서 제약 위반량·최대 위반이 baseline보다 악화되지 않음
 - fallback, 1분 deadline miss, train-support 밖 제어 0건
-- 공식 fixed-action MAPE가 exact-match·episode·유효 표본 기준 통과
-- soft constraint fallback 없이 엄격 만족률을 통과한 공식 후보 존재
+- 대표 fixed-action MAPE가 exact-match·episode·유효 표본 기준 통과
+- soft constraint fallback 없이 엄격 만족률을 통과한 대표 후보 존재
 
 > 현재 결과는 오프라인 시뮬레이션이며 실제 설비 절감 근거가 아님.
 > 최적 제어를 설비에 적용하기 전까지 `actual_closed_loop_mape.available=false`.

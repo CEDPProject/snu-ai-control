@@ -482,7 +482,7 @@ def _run_full_mpc_for_selected(cfg, selected_family, result_dir):
         'Full MPC run for selected evaluator completed: family=%s',
         selected_family,
     )
-    # strict 공식 KPI에는 coverage/sample이 담기지 않으므로, candidate-pool 평가에서
+    # strict 대표 지표에는 coverage/sample이 담기지 않으므로, candidate-pool 평가에서
     # 실제 평가된 행 수와 coverage를 함께 꺼내 kpi_coverage_summary가 쓰게 한다.
     candidate_pool_eval = summary.get('fixed_action_candidate_pool_evaluation') or {}
     pool_test = candidate_pool_eval.get('test_evaluation') or {}
@@ -668,9 +668,9 @@ def run_evaluator_benchmark(cfg):
             full_mpc_root,
         )
 
-    # strict 공식 KPI와 완화 provisional 값을 coverage·신뢰등급과 함께 요약한다.
+    # strict 대표 지표와 완화 provisional 값을 coverage·신뢰등급과 함께 요약한다.
     # support가 부족해 strict가 null이 되는 run도 provisional 값을 남겨 해석 가능하게
-    # 한다. provisional은 절대 공식값으로 승격하지 않는다(helper가 claim_boundary 부착).
+    # 한다. provisional은 절대 대표값으로 승격하지 않는다(helper가 claim_boundary 부착).
     kpi_coverage = None
     provisional_summary_cfg = cfg.MPC.get('provisional_kpi_summary')
     if provisional_summary_cfg is not None and bool(

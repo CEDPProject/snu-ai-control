@@ -413,11 +413,11 @@ def build_markdown(
         row["columns_over_10pct_missing"] for row in quality_rows if row["columns_over_10pct_missing"]
     })
     lines = [
-        "# 케이웨더 전력량 시계열 예측 실험 보고서", "",
+        "# 전력량 시계열 예측 실험 보고서", "",
         f"- 생성 시각: {generated_at}",
         f"- 데이터 버전: {data_version}", "",
         "## 기술 요약", "",
-        "현재 제공된 CSV에는 발전량 컬럼이 없으므로, 이 태스크는 첨부 페이지와 동일한 "
+        "이 태스크는 "
         "**전력 소비량 예측**으로 정의했다. 환기유효전력과 냉난방유효전력을 서로 독립된 "
         "단일 타깃으로 학습·평가한다.", "",
         f"- 실험 행렬: {len(models)}개 모델 × {len(environments)}개 공간 × "
@@ -477,9 +477,7 @@ def build_markdown(
         "5. Train 통계로 정규화하고 테스트 예측을 역정규화해 W 단위 지표를 계산한다.",
         "6. 동일 조합은 정식 epoch 결과를 우선하고, 없으면 최신 스모크 결과를 별도 표시한다.", "",
         "## 한계와 견고성", "",
-        "- 원시 데이터에는 발전량 컬럼이 없다. 실제 발전량 예측이 목표라면 발전량·일사량·"
-        "기상예보 컬럼과 별도의 타깃 정의가 필요하다.",
-        "- 단순 8:1:1 한 번의 홀드아웃 결과는 계절 일반화를 보장하지 않는다. "
+                "- 단순 8:1:1 한 번의 홀드아웃 결과는 계절 일반화를 보장하지 않는다. "
         "운영 적용 전 rolling-origin backtest가 필요하다.",
         "- 전력량 정확도는 평균 실제값이 0에 가까울 때 불안정하고 [0, 1] 범위에 제한되지 않는다. "
         "모델 선정은 MAE/RMSE를 주지표로 하고 정확도는 보조지표로 사용한다.",
@@ -492,10 +490,6 @@ def build_markdown(
         "2. 자동 재생성된 표에서 타깃별 MAE/RMSE 최우수 모델을 선택한다.",
         "3. persistence/seasonal-naive 기준선을 추가하고 rolling-origin 검증을 수행한다.",
         "4. MPC 입력으로 연결할 때 60분 구간별 오차와 불확실성을 함께 전달한다.", "",
-        "## 추가로 결정할 질문", "",
-        "- 여기서 말한 ‘발전량’이 실제 발전 설비 출력인지, 현재 CSV의 소비전력인지?",
-        "- 운영 모델 선정의 1차 기준을 MAE, RMSE, 전력량 정확도 중 무엇으로 둘지?",
-        "- 60개 시점 평균 외에 10/30/60분 lead-time별 성능도 표준 지표로 둘지?", "",
     ])
     return "\n".join(lines)
 
@@ -719,11 +713,11 @@ def build_artifact(
         },
     ]
     blocks = [
-        {"id": "title", "type": "markdown", "body": "# 케이웨더 전력량 시계열 예측 모델 기반 실험"},
+        {"id": "title", "type": "markdown", "body": "# 전력량 시계열 예측 모델 기반 실험"},
         {
             "id": "technical_summary", "type": "markdown", "sourceId": "dataset_csv",
             "body": (
-                "## 기술 요약\n\n현재 CSV에는 발전량 컬럼이 없어 **환기유효전력과 "
+                "## 기술 요약\n\n**환기유효전력과 "
                 "냉난방유효전력 소비량**을 각각 예측한다. 6개 모델, 3개 공간, 2개 타깃의 "
                 "36개 단일 타깃 실험을 120분 입력 → 60분 예측으로 정의했다."
             ),
@@ -761,7 +755,7 @@ def build_artifact(
         {
             "id": "results_intro", "type": "markdown", "sourceId": "forecast_results",
             "body": (
-                "## 모델 비교\n\n첨부 페이지와 동일하게 전력량 정확도와 MSE를 포함하되, "
+                "## 모델 비교\n\n전력량 정확도와 MSE를 포함하되, "
                 "정확도 분모가 작은 경우를 대비해 MAE·RMSE를 같이 보고한다. "
                 f"현재 정식 완료는 {completed}/{planned}회, 스모크는 {smoke}회이다. "
                 "스모크는 정식 완료에 포함하지 않고, 미실행 행에는 수치를 채우지 않는다."
@@ -781,7 +775,7 @@ def build_artifact(
         {
             "id": "limitations", "type": "markdown", "sourceId": "dataset_csv",
             "body": (
-                "## 한계와 견고성\n\n- 실제 발전량 예측에는 발전량·일사량·기상예보가 필요하다.\n"
+                "## 한계와 견고성\n\n"
                 "- 단일 8:1:1 홀드아웃은 계절 일반화를 보장하지 않아 rolling-origin 검증이 필요하다.\n"
                 "- 전력량 정확도는 평균 실제값이 0에 가까우면 음수 또는 큰 값이 될 수 있다.\n"
                 f"- 최대 단일 컬럼 결측률은 {max_column_missing_rate:.2%}이므로 대치 민감도를 검증해야 한다.\n"
@@ -796,14 +790,6 @@ def build_artifact(
                 "2. 타깃별 MAE/RMSE 최우수 모델을 선택한다.\n"
                 "3. persistence 기준선과 rolling-origin backtest를 추가한다.\n"
                 "4. MPC 연결 전 lead-time별 오차와 예측 불확실성을 산출한다."
-            ),
-        },
-        {
-            "id": "questions", "type": "markdown",
-            "body": (
-                "## 추가로 결정할 질문\n\n- ‘발전량’이 실제 발전 설비 출력인지 현재 소비전력인지?\n"
-                "- 운영 모델 선정의 주지표를 MAE, RMSE, 전력량 정확도 중 무엇으로 둘지?\n"
-                "- 10/30/60분 lead-time별 성능을 표준 보고 항목으로 둘지?"
             ),
         },
     ]
@@ -832,7 +818,7 @@ def build_artifact(
         "surface": "report",
         "manifest": {
             "version": 1, "surface": "report",
-            "title": "케이웨더 전력량 시계열 예측 모델 기반 실험",
+            "title": "전력량 시계열 예측 모델 기반 실험",
             "description": "Data profile, chronological split, experiment matrix, and evaluation.",
             "generatedAt": generated_at,
             "cards": cards, "charts": charts, "tables": tables,

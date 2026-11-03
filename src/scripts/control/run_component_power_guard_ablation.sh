@@ -21,7 +21,7 @@
 # two-stage report family.  It intentionally does not re-solve the MILP.
 #
 # Runs are strictly sequential: SciPy MILP and sklearn ExtraTrees are CPU/RAM
-# bound, and concurrent runs can exhaust this host's memory.
+# bound, and concurrent runs can exhaust memory.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,12 +1,12 @@
 """strict/provisional MPC KPI를 coverage·신뢰등급과 함께 요약한다.
 
-이 모듈의 목적은 support가 부족해 공식 strict KPI가 null이 되는 run도 "실패"로
+이 모듈의 목적은 support가 부족해 strict 대표 지표가 null이 되는 run도 "실패"로
 끝내지 않고, 완화(relaxed) 조건에서의 값·coverage·신뢰등급을 남겨 해석 가능하게
 만드는 것이다.
 
 원칙 (반드시 유지):
-- strict 공식 KPI의 의미와 계산은 그대로 둔다. 이 모듈은 요약만 한다.
-- provisional(완화) 값은 절대 공식값으로 승격하지 않는다. 항상
+- strict 대표 지표의 의미와 계산은 그대로 둔다. 이 모듈은 요약만 한다.
+- provisional(완화) 값은 절대 대표값으로 승격하지 않는다. 항상
   ``claim_boundary="diagnostic_only_not_official_kpi"``를 붙인다.
 - 모든 값에는 coverage(실제 평가된 test 행 비율)와 confidence_tier를 병기한다.
 

@@ -4,7 +4,7 @@
 (학습 파이프라인 ``src/main.py --task forecast`` 그대로 실행), 시험 구간의 모든 예측 구간(과거 120분 입력 →
 향후 60분 예측)을 추론해 학습 구간 기준 표준화 MSE를 계산한다. 대표값은 공간별 MSE의 산술평균(공간 평균)이고
 공간별 값은 세부 측정값으로 함께 출력한다. 프로그램은 측정값만 출력하고,
-목표값과의 비교·적합 판정은 하지 않는다(시험기관이 판정).
+목표값과의 비교·판정은 하지 않는다.
 
 학습 배치는 무작위 순서로 공급하고(``DATASET.shuffle=true``), 계속 증가하기만 하는 누적전력량 열
 (``IGNORE_FEATURES``)은 시험 구간 값이 학습 범위를 벗어나므로 입력에서 뺀다. ``--seeds``로 시드를 여러 개
@@ -162,6 +162,10 @@ def plot(results, trainings, out_dir: Path, font_path, day: str, note: str = '')
     import matplotlib.dates as mdates
 
     plt = _korean_font(font_path)
+    if day is None:  # 기본: 시험 구간의 첫 예측 시점이 속한 날
+        first = results[0]
+        day = str((first['_arrays']['first_target_time'][0]
+                   + np.timedelta64(first['pred_len'] - 1, 'm')).astype('datetime64[D]'))
     day_start = np.datetime64(day)
     day_end = day_start + np.timedelta64(1, 'D')
     fig, axes = plt.subplots(len(results), 1, figsize=(10, 2.8 * len(results)), dpi=150, squeeze=False)
@@ -222,7 +226,7 @@ def main():
                         help='학습 난수 시드 목록 (가중치 초기값·배치 순서). 공간마다 시드별로 학습·평가')
     parser.add_argument('--model', default='DLinear', help='학습할 예측 모델 (configs/model_setting.yaml 키)')
     parser.add_argument('--exp-name', default='kpi_test')
-    parser.add_argument('--plot-day', default='2026-07-20')
+    parser.add_argument('--plot-day', default=None, help='비교 그래프에 그릴 날짜 (YYYY-MM-DD, 기본: 시험 구간 첫날)')
     parser.add_argument('--plot-seed', type=int, default=None, help='그래프에 쓸 시드 (기본: 42가 있으면 42)')
     parser.add_argument('--font', type=Path, default=None)
     parser.add_argument('--replot', action='store_true',

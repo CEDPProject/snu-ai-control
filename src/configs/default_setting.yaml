@@ -242,7 +242,7 @@ MPC:
   candidate_pool_experiments:
     scenarios:
       - name: previous_7
-        description: 기존 1.95% validation gate를 통과한 7개 조합 재현
+        description: 기존 validation gate를 통과한 7개 조합 재현
         maximum_validation_mape_percent_per_candidate: 1.950
         maximum_candidates: 7
       - name: expanded_9
@@ -288,7 +288,7 @@ MPC:
           minimum_validation_mape_samples_per_candidate: 1
       # provisional 전용 초완화 시나리오 — v3/v5처럼 support가 희소해 strict가 null이
       # 되는 데이터에서도 진단용 값이 나오게 한다. train/validation/test 최소 1개까지
-      # 허용한다. 절대 공식 KPI로 쓰지 않는다(classification=provisional_only).
+      # 허용한다. 절대 대표 지표로 쓰지 않는다(classification=provisional_only).
       - name: relaxed_minimal_60
         description: provisional 전용 초완화 평가 — train/validation/test 최소 1 episode·1 sample까지 허용
         classification: provisional_only
@@ -309,7 +309,7 @@ MPC:
 
   # Train 3 / Validation 1 / Test 5 support를 만족하는 최대 41개 후보를
   # validation MAPE 순서로 하나씩 누적한다. report model은 한 번 선택·고정하고
-  # 모든 K에서 같은 예측을 재사용한다. 공식 K는 validation 목표를 만족하는
+  # 모든 K에서 같은 예측을 재사용한다. 대표 K는 validation 목표를 만족하는
   # 가장 큰 K이며, 다른 K의 test 값은 민감도 분석으로만 해석한다.
   candidate_pool_top_k_sweep:
     enabled: true
@@ -332,13 +332,13 @@ MPC:
       minimum_pooled_test_mape_samples: 30
       maximum_candidates: 41
 
-  # strict 공식 KPI와 완화(relaxed) provisional 값을 coverage·신뢰등급과 함께
+  # strict 대표 지표와 완화(relaxed) provisional 값을 coverage·신뢰등급과 함께
   # 하나의 요약으로 저장한다. strict의 의미는 그대로 유지하고, provisional은 절대
-  # 공식값으로 승격하지 않는다(claim_boundary=diagnostic_only_not_official_kpi).
+  # 대표값으로 승격하지 않는다(claim_boundary=diagnostic_only_not_official_kpi).
   # 목적: support가 부족해 strict가 null이 되는 run도 "실패"로 끝내지 않고,
   #       완화 조건에서의 값·coverage·신뢰등급을 남겨 해석 가능하게 한다.
   # 성분별(환기/냉난방)·총전력 전력예측을 설정 가능한 floor로 MAPE/WAPE 계산하고
-  # target(≤1.95%) pass/fail을 판정한다(방안 2: 지표 조정). 실제 action·MPC action
+  # target_percent 이하 여부(pass/fail)를 판정한다. 실제 action·MPC action
   # 예측을 모두 판정한다. 냉난방은 near-zero(≤1W)가 절반 이상이라 MAPE 분모가
   # 폭발하므로, floor로 near-zero를 제외하거나 WAPE(간헐부하 표준)로 함께 판정한다.
   # 이 값은 report model의 전력예측 정확도이며 MPC 절감/제어 성능이 아니다.
@@ -394,7 +394,7 @@ MPC:
       enabled: true
       # 41개 후보를 만들기 위해 test support를 1행까지 완화한 exploratory
       # sensitivity holdout이다. 따라서 아래 K prefix의 test 값 중
-      # selected_by_validation=true인 한 K만 공식 선택이고, 나머지는 모두
+      # selected_by_validation=true인 한 K만 대표 선택이고, 나머지는 모두
       # sensitivity-only로 표시한다.
       holdout_overrides:
         minimum_training_samples_per_candidate: 3
@@ -631,7 +631,7 @@ MPC:
     # action episode를 평가 전용 train/validation/test로 분리한 뒤 validation에서
     # 하나의 action을 확정한다. 최종 evaluator는 train+validation으로 학습 후
     # 고정하고 test 동일 action의 실제 총전력과 예측 총전력으로 표준 MAPE를
-    # 계산한다. 공식 KPI 대표값은 아래 fixed_action_candidate_pool이 담당한다.
+    # 계산한다. 대표값은 아래 fixed_action_candidate_pool이 담당한다.
     # 일반 MPC 학습·정책 평가는 계속 위의 시간순 8:1:1 split을 사용한다.
     fixed_optimal_action_holdout:
       enabled: true
@@ -666,7 +666,7 @@ MPC:
           냉난방전원: 'ON'
         maximum_state_satisfaction_loss_percent: 1.0
 
-      # 공식 MAPE 계산에만 쓰는 component-aware total-power report model이다.
+      # 대표 MAPE 계산에만 쓰는 component-aware total-power report model이다.
       # MPC/MILP의 affine power model, 목적함수, 제약, action 선택에는 연결하지 않는다.
       total_power_report_model:
         enabled: true
@@ -726,7 +726,7 @@ MPC:
         # null이면 minimum_action_samples를 ON-조건부 회귀의 최소 표본으로 쓴다.
         hvac_minimum_active_samples: null
 
-    # 공식 KPI는 validation MAPE 기준으로 고정한 여러 exact joint action의
+    # 대표 지표는 validation MAPE 기준으로 고정한 여러 exact joint action의
     # test 행을 합쳐 표준 sample-level MAPE로 계산한다. 단일 최적 action 평가는
     # 위 fixed_optimal_action_holdout에 진단용으로 계속 남는다.
     fixed_action_candidate_pool:
@@ -739,12 +739,12 @@ MPC:
       minimum_validation_mape_samples_per_candidate: 3
       minimum_test_mape_samples_per_candidate: 5
       minimum_pooled_test_mape_samples: 30
-      # 0이면 validation 기준을 통과한 후보를 모두 공식 pool에 포함한다.
+      # 0이면 validation 기준을 통과한 후보를 모두 대표 pool에 포함한다.
       maximum_candidates: 0
 
     # 보조 실험: exact joint action별 행을 8:1:1로 층화 배치한다. 같은 action의
     # 연속 episode가 여러 split에 나뉠 수 있으므로 미래시점·독립 episode 일반화
-    # 또는 strict 공식 KPI로 해석하지 않는다. 모든 유효 행을 한 번씩 배치하므로
+    # 또는 strict 대표 지표로 해석하지 않는다. 모든 유효 행을 한 번씩 배치하므로
     # 후보가 아닌 희소 action도 coverage 분모에는 남는다.
     action_stratified_row_evaluation:
       enabled: true
@@ -758,7 +758,7 @@ MPC:
 
     # 실제 장비에 새 제어를 적용할 수 없으므로, validation에서 실제 관측된
     # 공동 제어 조합만 후보로 삼고 test의 동일 조합 실제 Y로 MAPE를 계산한다.
-    # 이전 시간순 민감도 분석용으로만 유지하며, 공식 대표값은 위
+    # 이전 시간순 민감도 분석용으로만 유지하며, 대표값은 위
     # fixed_action_candidate_pool이다.
     observed_combination:
       enabled: false

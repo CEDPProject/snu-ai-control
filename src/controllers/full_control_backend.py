@@ -215,6 +215,12 @@ class FullControlBackend:
                 'physics_residual_is_not_full_PCNN': True,
                 'decision_focused_is_proxy_not_exact_MIP_differentiation': True,
                 'CEM_has_no_global_optimality_certificate': True,
+                'physical_transition_count_is_hypothetical': bool(
+                    self.cfg.CONTROL_BENCHMARK.planner.get('physical_transition_count', False)),
+                'quality_budget_uses_control_model_hold_reference_not_safety_certificate': bool(
+                    self.cfg.CONTROL_BENCHMARK.planner.get('quality_budget', False)),
+                'assumed_minimum_onoff_steps_not_verified_hardware_limit': int(
+                    self.cfg.CONTROL_BENCHMARK.planner.get('assumed_minimum_onoff_steps', 0)),
             },
         }
 
@@ -236,6 +242,8 @@ class ControllerAdapter:
 
     def __init__(self, backend, original, planner):
         self.backend, self.original, self.planner = backend, original, planner
+        self.capture_next_states = bool(OmegaConf.select(
+            backend.cfg, 'CAMPAIGN.capture_next_states', default=False))
         self.state_model = backend.state_projection
         self.power_model = backend.power_projection
 
@@ -249,13 +257,22 @@ class ControllerAdapter:
         if data is not self.backend.data:
             raise ValueError('Controller bootstrap dataset differs')
         self.backend.online_context = self.backend.contexts[row].copy()
-        if hasattr(self.planner, 'warm'):
+        # Dynamics memory resets at gaps; the applied-control reference follows
+        # the original evaluation's previous-command contract, not that reset.
+        self.applied_previous_control = (
+            data.controls[row-1].copy() if row else data.encoder.encode_action())
+        if hasattr(self.planner, 'reset'):
+            self.planner.reset()
+        elif hasattr(self.planner, 'warm'):
             self.planner.warm = None
 
     def observe_step(self, state, control, next_state):
         ctx = self.backend.online_context
         if not np.allclose(ctx[:self.backend.spec.nx], state):
             raise AssertionError('Controller context is not the applied plant state')
+        if hasattr(self.planner, 'observe_applied'):
+            self.planner.observe_applied(self.applied_previous_control, control)
+        self.applied_previous_control = np.asarray(control).copy()
         self.backend.online_context = self.backend.spec.advance(ctx, control, next_state)
 
     def solve(self, initial_state, disturbances, previous_control,
@@ -278,6 +295,7 @@ class ControllerAdapter:
                 'status': plan.status, 'elapsed_seconds': plan.elapsed_seconds,
                 'MILP_subproblem_optimal_status': plan.optimal, 'mip_gap': plan.mip_gap,
                 'has_incumbent': bool(len(plan.controls)),
+                'ablation_diagnostics': getattr(self.planner, 'last_diagnostics', {}),
             }, allow_nan=False)+'\n')
         spec = self.backend.spec
         if not len(plan.controls):

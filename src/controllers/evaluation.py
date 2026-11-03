@@ -1492,6 +1492,11 @@ def run_receding_horizon_policy(
             f'action_history_distance_{lag}': value
             for lag, value in history_diagnostics.get('distance_by_lag', {}).items()
         })
+        if getattr(controller, 'capture_next_states', False):
+            record.update({
+                f'next_state_{name}': float(states[step+1, position])
+                for position, name in enumerate(data.state_names)
+            })
         for position, name in enumerate(data.power_names):
             record[f'evaluator_{name}'] = float(powers[step, position])
             record[f'affine_{name}'] = float(affine_power[step, position])

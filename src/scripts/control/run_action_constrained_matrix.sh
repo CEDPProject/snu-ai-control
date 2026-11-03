@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 방안1(action 제약: action_trust + action_history + switch_penalty)
-# + 방안2(component_kpi_gate: 환기/냉난방/총전력 MAPE·WAPE ≤target 판정)를
+# action 제약(action_trust + action_history + switch_penalty)
+# + 성분별 gate(component_kpi_gate: 환기/냉난방/총전력 MAPE·WAPE ≤target 판정)를
 # 4개 데이터 구성 × livingroom 에 순차 적용한다.
 #
 # 각 run은 counterfactual 예측 직후 component_kpi_gate.{csv,json}을 산출하므로,
-# "제어 풀고 → report(실제/MPC action) → 실제 비교"가 성분별로 1.95%를 넘는지
+# "제어 풀고 → report(실제/MPC action) → 실제 비교"가 성분별로 target_percent를 넘는지
 # run 폴더에서 바로 확인할 수 있다.
 set -Euo pipefail
 
@@ -32,7 +32,7 @@ declare -A DATA_OPTS=(
 )
 DATA_ORDER=(v3 v4 v5 concat)
 
-# 방안1(제약) + 방안2(gate) 공통 옵션
+# action 제약 + 성분별 gate 공통 옵션
 COMMON_OPTS="MPC.evaluation.action_trust.enabled=true \
 MPC.objective.action_history.enabled=true \
 MPC.objective.action_history.penalty=2.0 \
